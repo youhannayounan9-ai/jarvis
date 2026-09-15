@@ -1,0 +1,54 @@
+# ── Secrets — NEVER commit ─────────────────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── Local databases & vector memory — NEVER commit ─────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+jarvis.db
+jarvis_data/
+
+# ── Python bytecode ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*$py.class
+*.so
+*.pyd
+
+# ── Virtual environments ───────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env/
+
+# ── uv ─────────────────────────────────────────────────────────────────────
+.uv/
+
+# ── Testing / coverage ─────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ── Distribution / packaging ───────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# ── IDEs / editors ─────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── OS / logs ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+logs/
+*.log
