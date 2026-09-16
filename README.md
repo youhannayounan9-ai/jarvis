@@ -2,19 +2,28 @@
 
 > A local, modular AI assistant — powered by Ollama. No paid APIs. No cloud.
 
-**JARVIS v0.1** — text-based CLI assistant with tool calling, persistent conversation history, and a clean modular architecture designed for progressive expansion.
+**JARVIS v0.5.0** — text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, and a clean modular architecture designed for progressive expansion.
 
 ---
 
-## Features (v0.1)
+## ✨ What's New in v0.5.0
+
+- **Web UI Dashboard** — Run JARVIS in a beautiful browser interface using Streamlit (`ui/dashboard.py`).
+- **`write_file` Tool** — JARVIS can now write and append to files (safely sandboxed with strict permission guards).
+- **Improved Synthesis Brevity** — The orchestrator now forces concise, natural answers without repeating raw tool outputs.
+
+---
+
+## Features
 
 - 💬 **Conversational AI** — full session memory backed by SQLite
 - 🛠️ **Tool calling** — LLM can autonomously call tools to answer questions
 - 🔍 **Web search** — DuckDuckGo (free, no API key)
 - 🕐 **Current time/date** — instant, no network
-- 📄 **Read files** — sandboxed to your project directory
+- 📄 **Read/Write files** — sandboxed to your project directory
 - 🔒 **Fully local** — your data never leaves your machine
 - 🏗️ **Modular** — adding a new tool takes ~30 lines
+- 🌐 **Web UI** — Streamlit-based interface with thought process observability
 
 ---
 
@@ -99,7 +108,13 @@ unless you want to change the model or sandbox directory.
 
 ## Running JARVIS
 
-Make sure Ollama is running (`ollama serve`), then:
+Make sure Ollama is running in the background:
+
+```bash
+ollama serve
+```
+
+Then, you can start JARVIS in CLI mode:
 
 ```bash
 jarvis
@@ -118,6 +133,16 @@ jarvis --voice
 ```
 
 Or from the text REPL: type `/voice`.
+
+---
+
+## Web UI Dashboard (v0.5)
+
+To launch the beautiful browser interface with thought process observability, run:
+
+```bash
+streamlit run ui/dashboard.py
+```
 
 ---
 
@@ -266,9 +291,9 @@ In short: create a file in `jarvis/tools/`, subclass `BaseTool`, register it in 
 | **v0.2** | ✅ Persistent vector memory (ChromaDB) + RAG |
 | **v0.3** | ✅ Plan-and-Execute multi-step agent loop |
 | **v0.4** | ✅ Voice input (Whisper) + voice output (Edge TTS) |
-| v0.5 | Vision (image understanding) |
-| v0.6 | Browser + computer automation (with permission model) |
-| v0.7 | Web UI (React + FastAPI) |
+| **v0.5** | ✅ Web UI (Streamlit) + write_file tool + synthesis polish |
+| v0.6 | Vision (image understanding) |
+| v0.7 | Browser + computer automation (with permission model) |
 
 ---
 

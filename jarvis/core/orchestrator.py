@@ -31,8 +31,11 @@ MAX_TOOL_ROUNDS = 5
 MAX_TOOL_ROUNDS_PER_STEP = 2
 
 _SYNTHESIZE_PROMPT = (
-    "Based on the executed steps and their results, provide a comprehensive, "
-    "final answer to the user's original request."
+    "Synthesize a single, natural, and concise final response based on the completed steps. "
+    "CRITICAL: Do NOT repeat raw tool outputs, step descriptions, or previous text verbatim. "
+    "Speak naturally and keep it brief. "
+    "If the user asks about their memory or personal facts, you MUST rely ONLY on the results from "
+    "the `recall_facts` tool. Do not make up or guess any facts."
 )
 
 

@@ -15,6 +15,7 @@ from jarvis.tools.registry import ToolRegistry
 from jarvis.tools.remember_fact import RememberFactTool
 from jarvis.tools.web_search import WebSearchTool
 from jarvis.tools.wikipedia_summary import WikipediaSummaryTool
+from jarvis.tools.write_file import WriteFileTool
 
 __all__ = [
     "BaseTool",
@@ -27,4 +28,5 @@ __all__ = [
     "CalculatorTool",
     "RememberFactTool",
     "RecallFactsTool",
+    "WriteFileTool",
 ]

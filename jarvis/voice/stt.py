@@ -9,11 +9,13 @@ directly so recording works even when ffmpeg is only used by Whisper internals.
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import wave
 from pathlib import Path
 
 import numpy as np
+import sounddevice as sd
 
 from jarvis.config import settings
 from jarvis.utils.logging import get_logger
@@ -76,6 +78,19 @@ class SpeechToText:
             )
             return ""
 
+        # Guard: Whisper requires ffmpeg to process audio; give the user a
+        # clear error rather than a cryptic [WinError 2] later in the stack.
+        try:
+            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=False)
+        except FileNotFoundError:
+            msg = (
+                "ERROR: FFmpeg is not found in your system PATH. "
+                "Please fully restart your terminal/IDE, or add FFmpeg to "
+                "your Windows Environment Variables."
+            )
+            log.error("stt_ffmpeg_not_found")
+            return msg
+
         wav_path: Path | None = None
         try:
             audio = self._record_microphone()
@@ -88,9 +103,18 @@ class SpeechToText:
             text = (result.get("text") or "").strip()
             log.info("stt_transcribe_done", chars=len(text), text_preview=text[:120])
             return text
+        except sd.PortAudioError as e:
+            log.error("stt_portaudio_error", error=str(e))
+            return (
+                "ERROR: Microphone access failed. Please check your microphone "
+                "and ensure PortAudio/sounddevice is installed."
+            )
         except Exception as e:
             log.error("stt_listen_failed", error=str(e))
-            return ""
+            return (
+                "ERROR: Microphone access failed. Please check your microphone "
+                "and ensure PortAudio/sounddevice is installed."
+            )
         finally:
             if wav_path is not None:
                 try:
@@ -100,8 +124,6 @@ class SpeechToText:
 
     def _record_microphone(self) -> np.ndarray:
         """Record mono float32 audio from the default input device."""
-        import sounddevice as sd
-
         frames = int(self._record_seconds * _SAMPLE_RATE)
         log.info(
             "stt_recording_start",
@@ -116,6 +138,9 @@ class SpeechToText:
                 dtype="float32",
             )
             sd.wait()
+        except sd.PortAudioError as e:
+            log.error("stt_microphone_portaudio_error", error=str(e))
+            raise
         except Exception as e:
             log.error("stt_microphone_error", error=str(e))
             raise RuntimeError(

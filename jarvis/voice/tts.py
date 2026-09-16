@@ -4,13 +4,14 @@ jarvis/voice/tts.py
 Text-to-Speech via Microsoft Edge TTS (free, no API key).
 
 Requires network access to Edge's TTS endpoint. Audio is played locally
-with ``playsound``.
+with ``ffplay`` (part of FFmpeg).
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -73,29 +74,25 @@ class TextToSpeech:
         await communicate.save(str(path))
 
     def _play(self, path: Path) -> None:
-        """Play an audio file; prefer playsound, fall back to ffplay."""
+        """Play an audio file using ffplay (bundled with FFmpeg)."""
         try:
-            from playsound import playsound
-
-            playsound(str(path), block=True)
-            return
-        except Exception as e:
-            log.warning("tts_playsound_failed", error=str(e))
-
-        # Fallback: ffmpeg's ffplay (Whisper already requires ffmpeg).
-        import shutil
-        import subprocess
-
-        ffplay = shutil.which("ffplay")
-        if not ffplay:
-            raise RuntimeError(
-                "Audio playback failed (playsound error and ffplay not found). "
-                "Install ffmpeg or fix playsound."
+            subprocess.run(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
+                capture_output=True,
+                check=True,
             )
-        subprocess.run(
-            [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
-            check=True,
-        )
+        except FileNotFoundError:
+            log.error("tts_ffplay_not_found")
+            raise RuntimeError(
+                "ERROR: Audio playback failed. "
+                "Ensure FFmpeg is installed and ffplay is in your system PATH."
+            )
+        except subprocess.CalledProcessError as e:
+            log.error("tts_ffplay_failed", returncode=e.returncode)
+            raise RuntimeError(
+                f"ERROR: Audio playback failed (ffplay exit code {e.returncode}). "
+                "Ensure FFmpeg is installed correctly."
+            )
 
 
 def _prepare_for_speech(text: str) -> str:

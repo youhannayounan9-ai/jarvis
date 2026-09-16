@@ -48,6 +48,7 @@ from jarvis.tools import (
     ToolRegistry,
     WebSearchTool,
     WikipediaSummaryTool,
+    WriteFileTool,
 )
 from jarvis.utils.logging import get_logger, setup_logging
 
@@ -65,6 +66,7 @@ _TOOL_BLURBS = {
     "calculator": "Evaluate a math expression",
     "remember_fact": "Save a long-term memory fact",
     "recall_facts": "Search long-term memory",
+    "write_file": "Write or append to a file",
 }
 
 
@@ -84,6 +86,7 @@ def _build_orchestrator() -> tuple[Orchestrator, SessionStore, ToolRegistry]:
     registry.register(CalculatorTool())
     registry.register(RememberFactTool())
     registry.register(RecallFactsTool())
+    registry.register(WriteFileTool())
 
     guard = PermissionGuard()
     orchestrator = Orchestrator(store, registry, guard)
@@ -267,7 +270,6 @@ def _chat_loop(
         try:
             user_input = Prompt.ask("[bold green]You[/bold green]").strip()
         except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Goodbye.[/dim]")
             break
 
         if not user_input:
@@ -276,7 +278,6 @@ def _chat_loop(
         command = user_input.lower()
 
         if command in ("/quit", "/exit", "/q"):
-            console.print("[dim]Goodbye.[/dim]")
             break
 
         if command == "/help":
@@ -321,6 +322,8 @@ def _chat_loop(
             padding=(1, 2),
         ))
         console.print()
+
+    console.print("\n[dim]Goodbye.[/dim]")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

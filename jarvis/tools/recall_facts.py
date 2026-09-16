@@ -16,9 +16,9 @@ log = get_logger(__name__)
 class RecallFactsTool(BaseTool):
     name = "recall_facts"
     description = (
-        "Searches long-term memory for facts about the user, their preferences, "
-        "or past projects. Use this when the user asks about something from the "
-        "past or you need context about them."
+        "CRITICAL: You MUST use this tool whenever the user asks a question "
+        "about themselves, their preferences, or past conversations. "
+        "Do not guess or hallucinate; search the database first."
     )
     parameters = {
         "type": "object",

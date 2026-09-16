@@ -33,13 +33,11 @@ class TestSpeechToText:
         audio = np.zeros(16000, dtype=np.float32)
 
         with patch.dict("sys.modules", {"whisper": fake_whisper}):
-            with patch(
-                "jarvis.voice.stt.SpeechToText._record_microphone",
-                return_value=audio,
-            ):
-                stt = SpeechToText(model_name="base", record_seconds=1.0)
-                assert stt.is_ready
-                text = stt.listen()
+            with patch("jarvis.voice.stt.SpeechToText._record_microphone", return_value=audio):
+                with patch("jarvis.voice.stt.subprocess.run"):  # mock ffmpeg PATH check
+                    stt = SpeechToText(model_name="base", record_seconds=1.0)
+                    assert stt.is_ready
+                    text = stt.listen()
 
         assert text == "Hello JARVIS"
         mock_model.transcribe.assert_called_once()

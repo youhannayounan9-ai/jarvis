@@ -16,9 +16,10 @@ log = get_logger(__name__)
 class RememberFactTool(BaseTool):
     name = "remember_fact"
     description = (
-        "Saves an important, long-term fact about the user, their preferences, "
-        "or ongoing projects. Use this when the user explicitly states something "
-        "they want you to remember."
+        "CRITICAL: You MUST use this tool whenever the user states a personal "
+        "fact, name, preference, or ongoing project. "
+        "Do not just say you remembered it in text; "
+        "you MUST call this tool to actually save it to the database."
     )
     parameters = {
         "type": "object",

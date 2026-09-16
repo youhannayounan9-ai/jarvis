@@ -6,6 +6,8 @@ Voice-mode session loop: listen → orchestrator → speak.
 
 from __future__ import annotations
 
+import time
+
 from jarvis.core.orchestrator import Orchestrator
 from jarvis.utils.logging import get_logger
 from jarvis.voice.stt import SpeechToText
@@ -71,10 +73,19 @@ class VoiceInterface:
                 except Exception as e:
                     log.error("voice_listen_error", error=str(e))
                     print(f"Could not hear you: {e}")
+                    time.sleep(3)
                     continue
 
+                # Back off if microphone returned an error or silence
                 if not user_input:
                     print("(No speech detected — try again.)")
+                    time.sleep(3)
+                    continue
+
+                if user_input.startswith("ERROR:"):
+                    print(f"⚠ {user_input}")
+                    log.warning("voice_stt_error", message=user_input)
+                    time.sleep(3)
                     continue
 
                 print(f"You: {user_input}")
