@@ -35,6 +35,7 @@ litellm.set_verbose = False
 def chat_completion(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
+    model: str | None = None,
 ) -> Any:
     """
     Send a synchronous chat completion request to Ollama via LiteLLM.
@@ -45,6 +46,8 @@ def chat_completion(
         tools:    Optional list of tool schemas in OpenAI function-calling
                   format. When provided, the model may respond with
                   tool_calls instead of (or in addition to) text.
+        model:    Optional LiteLLM model string override (e.g. planner model).
+                  Defaults to ``settings.litellm_model``.
 
     Returns:
         A LiteLLM ModelResponse object. Callers inspect:
@@ -56,15 +59,17 @@ def chat_completion(
         litellm.exceptions.BadRequestError:    Malformed request.
         Any other litellm exception for API-level errors.
     """
+    litellm_model = model or settings.litellm_model
+
     log.debug(
         "llm_request",
-        model=settings.litellm_model,
+        model=litellm_model,
         message_count=len(messages),
         tools_count=len(tools) if tools else 0,
     )
 
     kwargs: dict[str, Any] = {
-        "model": settings.litellm_model,
+        "model": litellm_model,
         "messages": messages,
         "max_tokens": settings.max_tokens,
         # Tell LiteLLM where the Ollama server lives.

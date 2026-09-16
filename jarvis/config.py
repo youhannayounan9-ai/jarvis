@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     # ── LLM / Ollama ──────────────────────────────────────────────────────────
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
+    # Optional separate model for the v0.3 planner (defaults to the main model).
+    planner_model: str = "qwen2.5:7b"
     max_tokens: int = 2048
     ollama_num_ctx: int = 8192  # Capped context window to prevent OOM on Qwen 2.5
 
@@ -52,6 +54,11 @@ class Settings(BaseSettings):
     # Default "." resolves to wherever `jarvis` is launched from.
     file_reader_allowed_dir: str = "."
 
+    # ── Voice (v0.4) ───────────────────────────────────────────────────────────
+    whisper_model: str = "base"  # tiny | base | small | medium | large
+    tts_voice: str = "en-US-GuyNeural"
+    voice_record_seconds: float = 5.0  # Mic capture length per listen()
+
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
 
@@ -64,6 +71,11 @@ class Settings(BaseSettings):
         which supports proper message formatting and tool calling.
         """
         return f"ollama_chat/{self.ollama_model}"
+
+    @property
+    def litellm_planner_model(self) -> str:
+        """LiteLLM model string used by the Plan-and-Execute planner."""
+        return f"ollama_chat/{self.planner_model}"
 
     @property
     def file_reader_allowed_path(self) -> Path:

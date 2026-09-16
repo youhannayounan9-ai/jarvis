@@ -1,29 +1,23 @@
 """
 jarvis/core/orchestrator.py
 ────────────────────────────
-The Orchestrator — the brain of JARVIS.
+The Orchestrator — the brain of JARVIS (v0.3 Plan-and-Execute).
 
-Every user message flows through here. The orchestrator:
-  1. Prepends the system prompt to the conversation.
-  2. Calls the LLM with the current history + tool schemas.
-  3. If the LLM requests tool calls, executes them (via PermissionGuard → ToolRegistry).
-  4. Feeds tool results back to the LLM.
-  5. Repeats until the LLM produces a plain text response (no more tool calls).
-  6. Persists all messages to the session store.
-  7. Returns the final text response.
-
-This loop is the "ReAct" (Reason + Act) pattern:
-  LLM thinks → decides to act → tool runs → LLM sees result → LLM thinks again.
+Every user message flows through here:
+  1. Plan  — decompose the request into discrete steps (Planner).
+  2. Execute — run a short ReAct loop per step (tools + PermissionGuard).
+  3. Synthesize — one final tool-free LLM call producing the user-facing answer.
 
 Safety bounds:
-  MAX_TOOL_ROUNDS caps how many tool-call / result cycles we allow per user
-  message. This prevents infinite loops if the LLM gets stuck requesting tools.
+  - MAX_TOOL_ROUNDS_PER_STEP caps ReAct iterations inside a single step.
+  - MAX_TOOL_ROUNDS caps total tool-call rounds across the whole request.
 """
 
 from typing import Any
 
 from jarvis.config import settings
 from jarvis.core.permissions import PermissionGuard
+from jarvis.core.planner import Planner
 from jarvis.llm.client import chat_completion
 from jarvis.memory.session_store import SessionStore
 from jarvis.tools.registry import ToolRegistry
@@ -31,20 +25,24 @@ from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-# Maximum number of tool-call rounds per user message.
-# If the LLM still hasn't given a plain text answer after this many rounds,
-# we break the loop and return whatever content is available.
+# Global cap on tool-call rounds for one user message (across all plan steps).
 MAX_TOOL_ROUNDS = 5
+# Per-step ReAct budget (also clipped by remaining global budget).
+MAX_TOOL_ROUNDS_PER_STEP = 2
+
+_SYNTHESIZE_PROMPT = (
+    "Based on the executed steps and their results, provide a comprehensive, "
+    "final answer to the user's original request."
+)
 
 
 class Orchestrator:
     """
-    Central request handler. Receives user messages, runs the tool-calling
-    loop, and returns the assistant's final text response.
+    Central request handler using Plan-and-Execute.
 
     Args:
-        session_store:   Persistence layer for conversation history.
-        tool_registry:   Registry of available tools.
+        session_store:    Persistence layer for conversation history.
+        tool_registry:    Registry of available tools.
         permission_guard: Controls which tools may execute.
     """
 
@@ -57,102 +55,206 @@ class Orchestrator:
         self._store = session_store
         self._registry = tool_registry
         self._guard = permission_guard
+        self._planner = Planner(llm_client=chat_completion)
 
     def chat(self, session_id: str, user_input: str) -> str:
         """
-        Process one user message and return the assistant's response.
+        Process one user message via Plan → Execute → Synthesize.
 
         Args:
-            session_id:  The ID of the current conversation session.
-            user_input:  The raw text typed by the user.
+            session_id: The ID of the current conversation session.
+            user_input: The raw text typed by the user.
 
         Returns:
             The assistant's final plain-text response string.
         """
-        # ── 1. Save the user's message ─────────────────────────────────────────
+        # ── 1. Persist the user turn ───────────────────────────────────────────
         user_message: dict[str, Any] = {"role": "user", "content": user_input}
         self._store.save_message(session_id, user_message)
 
-        # ── 2. Build the full message list for the LLM ─────────────────────────
-        # Load recent history (most-recent window — see SessionStore.load_history).
         history = self._store.load_history(session_id)
-
-        # System prompt is injected at call time (not stored) so it can change
-        # without a DB migration. A short memory cue reinforces follow-ups.
         memory_cue = (
             f"Short-term memory: {len(history)} message(s) from this session "
-            "are included below. Use them to resolve references and follow-ups."
+            "are included for reference. Use them to resolve follow-ups."
+        )
+        context_cue = _build_context_cue(history, memory_cue)
+
+        # ── 2. Plan phase ──────────────────────────────────────────────────────
+        plan = self._planner.generate_plan(user_input, context_cue)
+        log.info(
+            "plan_ready",
+            session_id=session_id,
+            steps=len(plan),
+            plan=[{
+                "step": s.get("step_number"),
+                "description": s.get("description"),
+                "tools": s.get("required_tools"),
+            } for s in plan],
+        )
+
+        # ── 3. Execute phase ───────────────────────────────────────────────────
+        completed_steps: list[dict[str, Any]] = []
+        remaining_rounds = MAX_TOOL_ROUNDS
+        tool_schemas = self._registry.get_schemas()
+
+        for step in plan:
+            step_number = int(step.get("step_number") or len(completed_steps) + 1)
+            description = str(step.get("description") or "").strip()
+            if not description:
+                continue
+
+            log.info(
+                "step_execute_start",
+                session_id=session_id,
+                step=step_number,
+                description=description,
+                remaining_tool_rounds=remaining_rounds,
+            )
+
+            step_messages = self._build_step_messages(
+                user_input=user_input,
+                memory_cue=memory_cue,
+                history=history,
+                step_number=step_number,
+                description=description,
+                completed_steps=completed_steps,
+            )
+
+            per_step_budget = min(MAX_TOOL_ROUNDS_PER_STEP, max(0, remaining_rounds))
+            step_result, rounds_used = self._run_react(
+                session_id=session_id,
+                messages=step_messages,
+                tool_schemas=tool_schemas,
+                max_rounds=per_step_budget,
+            )
+            remaining_rounds -= rounds_used
+
+            completed_steps.append({
+                "step_number": step_number,
+                "description": description,
+                "result": step_result,
+            })
+            log.info(
+                "step_execute_done",
+                session_id=session_id,
+                step=step_number,
+                rounds_used=rounds_used,
+                remaining_tool_rounds=remaining_rounds,
+            )
+
+            if remaining_rounds <= 0 and step is not plan[-1]:
+                log.warning(
+                    "global_tool_round_budget_exhausted",
+                    session_id=session_id,
+                    completed=len(completed_steps),
+                    planned=len(plan),
+                )
+                break
+
+        # ── 4. Synthesize phase ────────────────────────────────────────────────
+        final_text = self._synthesize(
+            session_id=session_id,
+            user_input=user_input,
+            memory_cue=memory_cue,
+            history=history,
+            completed_steps=completed_steps,
+        )
+        log.info(
+            "response_ready",
+            session_id=session_id,
+            steps_completed=len(completed_steps),
+        )
+        return final_text
+
+    # ── Step helpers ───────────────────────────────────────────────────────────
+
+    def _build_step_messages(
+        self,
+        *,
+        user_input: str,
+        memory_cue: str,
+        history: list[dict[str, Any]],
+        step_number: int,
+        description: str,
+        completed_steps: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Focused message list for one plan step."""
+        prior = _format_completed_steps(completed_steps)
+        step_brief = (
+            f"You are executing step {step_number} of a multi-step plan.\n"
+            f"Step description: {description}\n\n"
+            "Complete ONLY this step. Use tools if needed. "
+            "When done, reply with a concise result for this step."
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": settings.system_prompt},
             {"role": "system", "content": memory_cue},
             *history,
+            {"role": "user", "content": f"Original request:\n{user_input}"},
+            {"role": "system", "content": step_brief},
         ]
+        if prior:
+            messages.append({
+                "role": "system",
+                "content": f"Results from previously completed steps:\n{prior}",
+            })
+        return messages
 
-        tool_schemas = self._registry.get_schemas()
+    def _run_react(
+        self,
+        *,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        max_rounds: int,
+    ) -> tuple[str, int]:
+        """
+        Mini ReAct loop for a single plan step.
 
-        # ── 3. Tool-calling loop ───────────────────────────────────────────────
-        for round_num in range(MAX_TOOL_ROUNDS):
-            log.info("llm_call", session_id=session_id, round=round_num + 1)
+        Returns:
+            (final_text, rounds_used) where rounds_used counts LLM calls that
+            requested tools (or forced fallback rounds).
+        """
+        if max_rounds <= 0:
+            # No tool budget left — one tool-free call for a best-effort answer.
+            response = chat_completion(messages=messages, tools=None)
+            assistant_message = response.choices[0].message
+            assistant_dict = _message_to_dict(assistant_message)
+            self._store.save_message(session_id, assistant_dict)
+            return (assistant_message.content or ""), 0
 
+        rounds_used = 0
+        for round_num in range(max_rounds):
+            log.info(
+                "llm_call",
+                session_id=session_id,
+                round=round_num + 1,
+                phase="execute_step",
+            )
             response = chat_completion(messages=messages, tools=tool_schemas)
             assistant_message = response.choices[0].message
-
-            # Convert the response message to a dict for storage.
             assistant_dict = _message_to_dict(assistant_message)
-
-            # Check if the LLM wants to call any tools.
             tool_calls = getattr(assistant_message, "tool_calls", None)
 
             if not tool_calls:
-                # ── No tool calls → this is the final answer ──────────────────
                 self._store.save_message(session_id, assistant_dict)
-                final_text = assistant_message.content or ""
-                log.info("response_ready", session_id=session_id, rounds=round_num + 1)
-                return final_text
+                return (assistant_message.content or ""), rounds_used
 
-            # ── Tool calls requested → execute them all ────────────────────────
-            log.info("tool_calls_requested", count=len(tool_calls), round=round_num + 1)
-
-            # Save the assistant's tool-call message (no content, just tool_calls).
+            rounds_used += 1
+            log.info(
+                "tool_calls_requested",
+                count=len(tool_calls),
+                round=round_num + 1,
+            )
             self._store.save_message(session_id, assistant_dict)
             messages.append(assistant_dict)
 
-            # Execute each requested tool and collect results.
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
-                tool_args = tool_call.function.arguments  # JSON string
+                tool_args = tool_call.function.arguments
                 tool_call_id = tool_call.id
+                result = self._dispatch_with_permissions(tool_name, tool_args)
 
-                # ── Permission check (risk-aware) ─────────────────────────────
-                risk_level = self._registry.get_tool_risk_level(tool_name)
-
-                if self._guard.require_confirmation(tool_name, risk_level):
-                    result = (
-                        f"ERROR: Tool '{tool_name}' requires explicit user "
-                        "confirmation, which is not yet supported in this "
-                        "interface. Please inform the user that this action "
-                        "cannot be performed automatically."
-                    )
-                    log.warning(
-                        "tool_requires_confirmation",
-                        tool=tool_name,
-                        risk_level=risk_level,
-                    )
-                elif not self._guard.is_allowed(tool_name, risk_level):
-                    result = (
-                        f"ERROR: Tool '{tool_name}' is not permitted "
-                        f"(Risk Level: {risk_level})."
-                    )
-                    log.warning(
-                        "tool_blocked",
-                        tool=tool_name,
-                        risk_level=risk_level,
-                    )
-                else:
-                    result = self._registry.dispatch(tool_name, tool_args)
-
-                # Tool result message (OpenAI tool role format).
                 tool_result_message: dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
@@ -162,17 +264,111 @@ class Orchestrator:
                 self._store.save_message(session_id, tool_result_message)
                 messages.append(tool_result_message)
 
-        # ── 4. Safety: MAX_TOOL_ROUNDS exceeded ────────────────────────────────
-        # Make one final call without tools to force a text response.
-        log.warning("max_tool_rounds_exceeded", session_id=session_id)
+        # Step budget exhausted — force a text wrap-up without tools.
+        log.warning("max_tool_rounds_exceeded", session_id=session_id, phase="step")
         final_response = chat_completion(messages=messages, tools=None)
         final_message = final_response.choices[0].message
         final_dict = _message_to_dict(final_message)
         self._store.save_message(session_id, final_dict)
-        return final_message.content or "I ran into an issue completing that request."
+        return (
+            final_message.content or "ERROR: Step could not be completed within tool budget.",
+            rounds_used,
+        )
+
+    def _dispatch_with_permissions(self, tool_name: str, tool_args: str) -> str:
+        """Run PermissionGuard checks, then registry dispatch."""
+        risk_level = self._registry.get_tool_risk_level(tool_name)
+
+        if self._guard.require_confirmation(tool_name, risk_level):
+            log.warning(
+                "tool_requires_confirmation",
+                tool=tool_name,
+                risk_level=risk_level,
+            )
+            return (
+                f"ERROR: Tool '{tool_name}' requires explicit user "
+                "confirmation, which is not yet supported in this "
+                "interface. Please inform the user that this action "
+                "cannot be performed automatically."
+            )
+
+        if not self._guard.is_allowed(tool_name, risk_level):
+            log.warning(
+                "tool_blocked",
+                tool=tool_name,
+                risk_level=risk_level,
+            )
+            return (
+                f"ERROR: Tool '{tool_name}' is not permitted "
+                f"(Risk Level: {risk_level})."
+            )
+
+        return self._registry.dispatch(tool_name, tool_args)
+
+    def _synthesize(
+        self,
+        *,
+        session_id: str,
+        user_input: str,
+        memory_cue: str,
+        history: list[dict[str, Any]],
+        completed_steps: list[dict[str, Any]],
+    ) -> str:
+        """Final tool-free call that turns step results into the user answer."""
+        steps_blob = _format_completed_steps(completed_steps) or "(no steps completed)"
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": settings.system_prompt},
+            {"role": "system", "content": memory_cue},
+            *history,
+            {"role": "user", "content": f"Original request:\n{user_input}"},
+            {
+                "role": "system",
+                "content": (
+                    f"{_SYNTHESIZE_PROMPT}\n\n"
+                    f"Executed steps and results:\n{steps_blob}"
+                ),
+            },
+        ]
+
+        log.info("llm_call", session_id=session_id, phase="synthesize")
+        response = chat_completion(messages=messages, tools=None)
+        assistant_message = response.choices[0].message
+        assistant_dict = _message_to_dict(assistant_message)
+        self._store.save_message(session_id, assistant_dict)
+        return (
+            assistant_message.content
+            or "I ran into an issue completing that request."
+        )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _build_context_cue(history: list[dict[str, Any]], memory_cue: str) -> str:
+    """Compact context string for the planner (not full message objects)."""
+    snippets: list[str] = []
+    for msg in history[-6:]:
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+        if msg.get("tool_calls"):
+            content = "[tool call]"
+        if not content:
+            continue
+        snippets.append(f"{role}: {content[:240]}")
+    recent = "\n".join(snippets) if snippets else "(no prior messages)"
+    return f"{memory_cue}\nRecent conversation:\n{recent}"
+
+
+def _format_completed_steps(completed_steps: list[dict[str, Any]]) -> str:
+    if not completed_steps:
+        return ""
+    lines: list[str] = []
+    for step in completed_steps:
+        lines.append(
+            f"Step {step.get('step_number')}: {step.get('description')}\n"
+            f"Result: {step.get('result')}"
+        )
+    return "\n\n".join(lines)
+
 
 def _message_to_dict(message: Any) -> dict[str, Any]:
     """
@@ -186,7 +382,6 @@ def _message_to_dict(message: Any) -> dict[str, Any]:
 
     tool_calls = getattr(message, "tool_calls", None)
     if tool_calls:
-        # Serialise tool_calls to a list of dicts (they may be objects).
         d["tool_calls"] = [
             {
                 "id": tc.id,

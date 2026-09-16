@@ -111,29 +111,70 @@ Or, if the script isn't on your PATH:
 python -m jarvis.main
 ```
 
-### Example session
+### Voice mode
 
+```bash
+jarvis --voice
 ```
-╭─ J.A.R.V.I.S ──────────────────────────────╮
-│ v0.1 — Local AI Assistant                   │
-│ Model: qwen2.5:7b   |  Type /help for commands │
-╰─────────────────────────────────────────────╯
 
-You: What time is it?
-⠋ Thinking…
+Or from the text REPL: type `/voice`.
 
-╭─ JARVIS ────────────────────────────────────╮
-│ It's Monday, September 15, 2026 at 22:42:00 │
-│ (UTC+0300).                                  │
-╰─────────────────────────────────────────────╯
+---
 
-You: Search for the latest news on local LLMs
-⠙ Thinking…
+## Voice Mode (v0.4)
 
-╭─ JARVIS ────────────────────────────────────╮
-│ Here's what I found…                        │
-╰─────────────────────────────────────────────╯
+JARVIS can listen with **Whisper** (local STT) and speak with **Edge TTS** (free neural voices).
+
+### Prerequisites
+
+1. **ffmpeg** (required by Whisper)
+
+| Platform | Install |
+|----------|---------|
+| Windows | `winget install FFmpeg` or download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to `PATH` |
+| macOS | `brew install ffmpeg` |
+| Linux | `sudo apt install ffmpeg` (Debian/Ubuntu) |
+
+Verify:
+
+```bash
+ffmpeg -version
 ```
+
+2. **Microphone** access allowed for your terminal / Python in OS privacy settings.
+
+3. **Internet** for Edge TTS (speech synthesis is streamed from Microsoft Edge’s free TTS endpoint). Recognition itself is local via Whisper.
+
+### Start voice mode
+
+```bash
+# Directly
+jarvis --voice
+
+# Or inside the text REPL
+/voice
+```
+
+Say **“exit”** or **“quit”** (or press `Ctrl+C`) to leave voice mode.
+
+### Configuration
+
+```env
+WHISPER_MODEL=base              # tiny | base | small | medium | large
+TTS_VOICE=en-US-GuyNeural       # Edge neural voice
+VOICE_RECORD_SECONDS=5          # Seconds of mic capture per turn
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Whisper fails to load / “ffmpeg not found” | Install ffmpeg and restart the terminal so `PATH` updates |
+| No speech detected | Check mic permissions; speak during the “Listening…” window; raise `VOICE_RECORD_SECONDS` |
+| TTS silent / network errors | Edge TTS needs internet; try another `TTS_VOICE` or check firewall |
+| `playsound` errors on Windows | Install ffmpeg (`ffplay` is used as a fallback player) |
+
+Text CLI mode remains fully available and is the default when you run `jarvis` without `--voice`.
 
 ---
 
@@ -144,6 +185,7 @@ You: Search for the latest news on local LLMs
 | `/help` | Show all commands |
 | `/tools` | List registered tools |
 | `/history` | Print this session's messages |
+| `/voice` | Enter voice mode |
 | `/new` | Start a fresh session |
 | `/quit` | Exit JARVIS |
 
@@ -159,6 +201,11 @@ OLLAMA_BASE_URL=http://localhost:11434
 MAX_TOKENS=2048
 FILE_READER_ALLOWED_DIR=.      # Sandbox for read_file tool
 LOG_LEVEL=INFO                 # DEBUG | INFO | WARNING | ERROR
+
+# Voice (v0.4)
+WHISPER_MODEL=base
+TTS_VOICE=en-US-GuyNeural
+VOICE_RECORD_SECONDS=5
 ```
 
 ---
@@ -216,9 +263,9 @@ In short: create a file in `jarvis/tools/`, subclass `BaseTool`, register it in 
 | Version | Goal |
 |---------|------|
 | **v0.1** | ✅ CLI + Ollama + tool calling + SQLite history |
-| v0.2 | Persistent vector memory (ChromaDB) + RAG |
-| v0.3 | Agent loop for multi-step tasks |
-| v0.4 | Voice input (Whisper) + voice output (TTS) |
+| **v0.2** | ✅ Persistent vector memory (ChromaDB) + RAG |
+| **v0.3** | ✅ Plan-and-Execute multi-step agent loop |
+| **v0.4** | ✅ Voice input (Whisper) + voice output (Edge TTS) |
 | v0.5 | Vision (image understanding) |
 | v0.6 | Browser + computer automation (with permission model) |
 | v0.7 | Web UI (React + FastAPI) |
