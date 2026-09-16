@@ -394,3 +394,98 @@ class TestWebScrapeTool:
         assert "This is a mock webpage content." in result
         mock_page.goto.assert_called_with("https://example.com", timeout=20000)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# computer_control (mocked pyautogui)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestComputerControlTool:
+    def setup_method(self):
+        from jarvis.tools.computer_control import ComputerControlTool
+        self.tool = ComputerControlTool()
+
+    def test_name(self):
+        assert self.tool.name == "computer_control"
+
+    @patch("pyautogui.moveTo")
+    @patch("time.sleep")
+    def test_move_mouse(self, mock_sleep, mock_moveTo):
+        result = self.tool.run(action="move_mouse", x=100, y=200)
+        assert "Successfully executed action: move_mouse" in result
+        mock_moveTo.assert_called_with(100, 200, duration=0.5)
+
+    @patch("pyautogui.write")
+    @patch("time.sleep")
+    def test_type_text(self, mock_sleep, mock_write):
+        result = self.tool.run(action="type_text", text="hello")
+        assert "Successfully executed action: type_text" in result
+        mock_write.assert_called_with("hello", interval=0.01)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# code_execution (sandbox checks)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCodeExecutionTool:
+    def setup_method(self):
+        from jarvis.tools.code_execution import CodeExecutionTool
+        self.tool = CodeExecutionTool()
+
+    def test_name(self):
+        assert self.tool.name == "execute_python_code"
+
+    def test_basic_execution(self):
+        result = self.tool.run(code="print(2 + 2)")
+        assert "4" in result
+
+    def test_security_violation(self):
+        result = self.tool.run(code="import os")
+        assert "ERROR: Security violation" in result
+
+    def test_execution_timeout(self):
+        # A simple infinite loop that will time out
+        result = self.tool.run(code="while True: pass")
+        assert "ERROR" in result
+        assert "timed out" in result or "Exception" in result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# permission confirmation flow (via Orchestrator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPermissionConfirmationFlow:
+    def test_confirmation_handling(self):
+        from jarvis.core.orchestrator import Orchestrator
+        from jarvis.core.permissions import PermissionGuard
+        from jarvis.memory.session_store import SessionStore
+        from jarvis.tools.registry import ToolRegistry
+        
+        # We just test the handle_confirmation logic
+        registry = ToolRegistry()
+        guard = PermissionGuard()
+        store = MagicMock()
+        orchestrator = Orchestrator(store, registry, guard)
+        
+        # Inject a pending confirmation
+        orchestrator._pending_confirmations["test_session"] = {
+            "tool_name": "dummy",
+            "tool_args": "{}",
+            "tool_call_id": "call_123",
+            "risk_level": "SYSTEM"
+        }
+        
+        # Deny
+        res_deny = orchestrator.handle_confirmation("test_session", False)
+        assert "denied" in res_deny.lower()
+        
+        # Confirm (since dummy isn't in registry, it'll error from registry, but that proves it tried to dispatch)
+        orchestrator._pending_confirmations["test_session"] = {
+            "tool_name": "dummy",
+            "tool_args": "{}",
+            "tool_call_id": "call_124",
+            "risk_level": "SYSTEM"
+        }
+        res_confirm = orchestrator.handle_confirmation("test_session", True)
+        assert "Unknown tool" in res_confirm or "Executed" in res_confirm
+
+

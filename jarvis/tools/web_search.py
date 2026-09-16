@@ -19,6 +19,7 @@ Note on rate limiting:
 
 import re
 from ddgs import DDGS
+from cachetools import TTLCache, cached
 
 from jarvis.tools.base import BaseTool
 from jarvis.utils.logging import get_logger
@@ -27,6 +28,7 @@ log = get_logger(__name__)
 
 _DEFAULT_MAX_RESULTS = 5
 _MAX_SNIPPET_CHARS = 320
+_search_cache = TTLCache(maxsize=100, ttl=3600)
 
 
 class WebSearchTool(BaseTool):
@@ -81,9 +83,7 @@ class WebSearchTool(BaseTool):
             return "ERROR: Search query must not be empty."
 
         try:
-            with DDGS() as ddgs:
-                # Fetch a few extras so we can drop duplicates/empty rows.
-                raw = list(ddgs.text(query, max_results=min(max_results + 3, 12)))
+            raw = self._do_search(query, max_results)
         except Exception as e:
             log.error("web_search_failed", query=query, error=str(e))
             return f"ERROR: Web search failed: {e}"
@@ -97,6 +97,12 @@ class WebSearchTool(BaseTool):
             )
 
         return _format_results(query, results)
+
+    @staticmethod
+    @cached(cache=_search_cache)
+    def _do_search(query: str, max_results: int) -> list[dict]:
+        with DDGS() as ddgs:
+            return list(ddgs.text(query, max_results=min(max_results + 3, 12)))
 
 
 def _normalize_results(raw: list[dict], limit: int) -> list[dict[str, str]]:

@@ -2,16 +2,16 @@
 
 > A local, modular AI assistant — powered by Ollama. No paid APIs. No cloud.
 
-**JARVIS v0.6.0** — text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, Vision, Browser Automation, and a clean modular architecture designed for progressive expansion.
+**JARVIS v0.8.0** — text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, Vision, Browser Automation, Computer Automation, Safe Code Execution, Advanced Permissions, and a clean modular architecture designed for progressive expansion.
 
 ---
 
-## ✨ What's New in v0.6.0
+## ✨ What's New in v0.8.0
 
-- **Vision Capability** — Upload images for JARVIS to analyze via `ollama_chat/llava` in the Web UI.
-- **Deep Web Scraping** — Playwright-powered `web_scrape` tool for reading full web pages directly.
-
-*Note: For these features to work, run `ollama pull llava` and `playwright install chromium`.*
+- 🖱️ **Computer Automation** — `computer_control` tool to automate mouse and keyboard actions safely via PyAutoGUI.
+- 🐍 **Safe Code Execution** — `execute_python_code` tool providing a safe, restricted sandbox to process data and math.
+- 🔐 **Advanced Permission System** — Confirmation flow for high-risk tools via CLI (`/confirm`, `/deny`) and the Web UI.
+- ⚡ **Performance Optimization** — Session store LRU caching and `web_search` TTL caching via `cachetools`.
 
 ---
 
@@ -135,6 +135,14 @@ jarvis --voice
 ```
 
 Or from the text REPL: type `/voice`.
+
+## Security & Safety
+
+JARVIS employs a strict permission model to ensure your machine stays secure.
+- **Sandboxed File Reading:** `read_file` is strictly limited to paths relative to `FILE_READER_ALLOWED_DIR`.
+- **Restricted Code Execution:** `execute_python_code` disables destructive builtins (`__import__`, `eval`, `exec`, `open`, etc) and enforces a 5-second timeout.
+- **High Risk Action Confirmation:** Operations tagged as `SYSTEM` or `DESTRUCTIVE` (like `computer_control` or `write_file` depending on configuration) require explicit user confirmation.
+- **No Network Egress for Code:** The python sandbox has no access to sockets or urllib.
 
 ---
 
@@ -285,19 +293,27 @@ In short: create a file in `jarvis/tools/`, subclass `BaseTool`, register it in 
 
 ---
 
-## Roadmap
+## Roadmap & Versions
 
-| Version | Goal |
-|---------|------|
-| **v0.1** | ✅ CLI + Ollama + tool calling + SQLite history |
-| **v0.2** | ✅ Persistent vector memory (ChromaDB) + RAG |
+| Version | Highlights |
+| :--- | :--- |
+| **v0.1** | ✅ Basic CLI, simple tools, SQLite memory |
+| **v0.2** | ✅ Long-term memory (ChromaDB + embeddings) |
 | **v0.3** | ✅ Plan-and-Execute multi-step agent loop |
 | **v0.4** | ✅ Voice input (Whisper) + voice output (Edge TTS) |
 | **v0.5** | ✅ Web UI (Streamlit) + write_file tool + synthesis polish |
 | **v0.6** | ✅ Vision (image understanding) + Playwright web scrape |
-| v0.7 | Browser + computer automation (with permission model) |
+| **v0.8** | ✅ Computer automation, Code Sandbox, Advanced Permissions, Caching |
 
 ---
+
+## Troubleshooting
+
+- **LiteLLM / Ollama Error:** Ensure Ollama is running in the background (`ollama serve`). If you're missing a model, run `ollama pull <model-name>`.
+- **Playwright errors:** Ensure the chromium binaries are installed via `playwright install chromium`.
+- **Voice errors:** Ensure `ffmpeg` is on your system `PATH`.
+- **PyAutoGUI failsafe:** If mouse automation goes out of control, quickly move your physical mouse to any of the 4 corners of your primary screen to trigger the failsafe.
+
 
 ## License
 

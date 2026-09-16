@@ -20,7 +20,8 @@ Schema:
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -122,7 +123,9 @@ class SessionStore:
             ),
         )
         self._conn.commit()
+        self.load_history.cache_clear()
 
+    @lru_cache(maxsize=100)
     def load_history(
         self,
         session_id: str,
@@ -184,6 +187,25 @@ class SessionStore:
             limit=limit,
         )
         return messages
+
+    def cleanup_old_sessions(self, max_age_days: int = 30) -> int:
+        """Delete sessions older than max_age_days."""
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
+        cutoff_iso = cutoff.isoformat()
+        
+        self._conn.execute(
+            "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE created_at < ?)",
+            (cutoff_iso,)
+        )
+        
+        cursor = self._conn.execute(
+            "DELETE FROM sessions WHERE created_at < ?",
+            (cutoff_iso,)
+        )
+        deleted = cursor.rowcount
+        self._conn.commit()
+        log.info("cleanup_old_sessions", deleted=deleted, max_age_days=max_age_days)
+        return deleted
 
     def close(self) -> None:
         """Close the database connection cleanly."""

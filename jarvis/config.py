@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
 
+    # ── Security ──────────────────────────────────────────────────────────────
+    REQUIRE_CONFIRMATION_FOR_HIGH_RISK: bool = True
+
     # ── Derived helpers (not from env) ────────────────────────────────────────
     @property
     def litellm_model(self) -> str:

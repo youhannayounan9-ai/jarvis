@@ -59,6 +59,7 @@ class Orchestrator:
         self._registry = tool_registry
         self._guard = permission_guard
         self._planner = Planner(llm_client=chat_completion)
+        self._pending_confirmations: dict[str, Any] = {}
 
     def chat(self, session_id: str, user_input: str) -> str:
         """
@@ -169,6 +170,35 @@ class Orchestrator:
         )
         return final_text
 
+    def get_pending_confirmation(self, session_id: str) -> dict[str, Any] | None:
+        return self._pending_confirmations.get(session_id)
+
+    def handle_confirmation(self, session_id: str, confirmed: bool) -> str:
+        pending = self._pending_confirmations.pop(session_id, None)
+        if not pending:
+            return "No pending actions to confirm or deny."
+        
+        tool_name = pending["tool_name"]
+        tool_args = pending["tool_args"]
+        tool_call_id = pending["tool_call_id"]
+        
+        if not confirmed:
+            result = f"User denied execution of {tool_name}."
+        else:
+            result = self._registry.dispatch(tool_name, tool_args)
+            
+        tool_result_message: dict[str, Any] = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": result,
+        }
+        self._store.save_message(session_id, tool_result_message)
+        
+        # We need to trigger synthesize to finish the loop, or just tell the user.
+        # But this is a simple CLI, we just return the result for now.
+        return f"Executed {tool_name}. Result: {result}"
+
     # ── Step helpers ───────────────────────────────────────────────────────────
 
     def _build_step_messages(
@@ -256,7 +286,7 @@ class Orchestrator:
                 tool_name = tool_call.function.name
                 tool_args = tool_call.function.arguments
                 tool_call_id = tool_call.id
-                result = self._dispatch_with_permissions(tool_name, tool_args)
+                result = self._dispatch_with_permissions(session_id, tool_name, tool_args, tool_call_id)
 
                 tool_result_message: dict[str, Any] = {
                     "role": "tool",
@@ -278,22 +308,23 @@ class Orchestrator:
             rounds_used,
         )
 
-    def _dispatch_with_permissions(self, tool_name: str, tool_args: str) -> str:
+    def _dispatch_with_permissions(self, session_id: str, tool_name: str, tool_args: str, tool_call_id: str) -> str:
         """Run PermissionGuard checks, then registry dispatch."""
         risk_level = self._registry.get_tool_risk_level(tool_name)
 
-        if self._guard.require_confirmation(tool_name, risk_level):
+        if getattr(settings, "REQUIRE_CONFIRMATION_FOR_HIGH_RISK", False) and self._guard.require_confirmation(tool_name, risk_level):
             log.warning(
                 "tool_requires_confirmation",
                 tool=tool_name,
                 risk_level=risk_level,
             )
-            return (
-                f"ERROR: Tool '{tool_name}' requires explicit user "
-                "confirmation, which is not yet supported in this "
-                "interface. Please inform the user that this action "
-                "cannot be performed automatically."
-            )
+            self._pending_confirmations[session_id] = {
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "tool_call_id": tool_call_id,
+                "risk_level": risk_level
+            }
+            return f"ACTION_REQUIRES_CONFIRMATION: This action ({tool_name}) requires explicit user approval. Please confirm to proceed."
 
         if not self._guard.is_allowed(tool_name, risk_level):
             log.warning(

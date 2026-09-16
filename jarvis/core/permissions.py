@@ -37,7 +37,7 @@ _ALLOWED_RISKS: frozenset[str] = frozenset({"SAFE", "NETWORK", "FILE_READ"})
 
 # Blocked until confirmation UI lands; also flagged by require_confirmation().
 _CONFIRMATION_RISKS: frozenset[str] = frozenset(
-    {"FILE_WRITE", "SYSTEM", "DESTRUCTIVE"}
+    {"SYSTEM", "DESTRUCTIVE"}
 )
 
 
@@ -45,6 +45,15 @@ class PermissionGuard:
     """
     Enforces which tools may be called based on declared risk level.
     """
+
+    def __init__(self):
+        self._tool_risks: dict[str, str] = {}
+
+    def register_tool_risk(self, tool_name: str, risk_level: str) -> None:
+        self._tool_risks[tool_name] = risk_level
+
+    def get_tool_risk_level(self, tool_name: str) -> str:
+        return self._tool_risks.get(tool_name, "UNKNOWN")
 
     def is_allowed(self, tool_name: str, risk_level: str) -> bool:
         """

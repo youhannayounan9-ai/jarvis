@@ -7,6 +7,8 @@ All tool classes are importable from here for convenience.
 
 from jarvis.tools.base import BaseTool
 from jarvis.tools.calculator import CalculatorTool
+from jarvis.tools.code_execution import CodeExecutionTool
+from jarvis.tools.computer_control import ComputerControlTool
 from jarvis.tools.datetime_tool import GetCurrentDatetimeTool
 from jarvis.tools.directory_lister import ListDirectoryTool
 from jarvis.tools.file_reader import ReadFileTool
@@ -33,4 +35,6 @@ __all__ = [
     "WriteFileTool",
     "VisionAnalyzeTool",
     "WebScrapeTool",
+    "CodeExecutionTool",
+    "ComputerControlTool",
 ]

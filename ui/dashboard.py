@@ -28,6 +28,8 @@ from jarvis.tools import (
     WriteFileTool,
     VisionAnalyzeTool,
     WebScrapeTool,
+    CodeExecutionTool,
+    ComputerControlTool,
 )
 
 # ── Page Config ───────────────────────────────────────────────────────────────
@@ -52,6 +54,8 @@ def get_jarvis_components():
     registry.register(RecallFactsTool())
     registry.register(VisionAnalyzeTool())
     registry.register(WebScrapeTool())
+    registry.register(CodeExecutionTool())
+    registry.register(ComputerControlTool())
     
     guard = PermissionGuard()
     orchestrator = Orchestrator(store, registry, guard)
@@ -74,9 +78,13 @@ def start_new_session():
 
 
 # ── UI Layout ─────────────────────────────────────────────────────────────────
-st.sidebar.title("JARVIS v0.6 Dashboard")
+st.sidebar.title("JARVIS v0.8 Dashboard")
 st.sidebar.button("New Session", on_click=start_new_session)
-st.sidebar.caption(f"Current Session: `{st.session_state.session_id[:8]}...`")
+
+st.sidebar.markdown("### Active Session")
+st.sidebar.caption(f"Session ID: `{st.session_state.session_id[:8]}...`")
+msg_count = store.message_count(st.session_state.session_id)
+st.sidebar.caption(f"Messages: {msg_count}")
 
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
@@ -130,6 +138,22 @@ if user_input := st.chat_input("How can I help you?"):
             except Exception as e:
                 st.error(f"Error: {e}")
                 response = None
+
+pending = orchestrator.get_pending_confirmation(st.session_state.session_id)
+if pending:
+    st.warning(f"⚠️ This action requires your confirmation: **{pending['tool_name']}**")
+    st.code(pending['tool_args'])
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Confirm", type="primary"):
+            response = orchestrator.handle_confirmation(st.session_state.session_id, True)
+            st.success(response)
+            st.rerun()
+    with col2:
+        if st.button("Deny"):
+            response = orchestrator.handle_confirmation(st.session_state.session_id, False)
+            st.error(response)
+            st.rerun()
 
     # Load updated history to find the thought process for this turn
     updated_history = store.load_history(st.session_state.session_id)

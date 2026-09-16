@@ -40,6 +40,8 @@ from jarvis.memory.session_store import SessionStore
 from jarvis.memory.vector_store import get_vector_store
 from jarvis.tools import (
     CalculatorTool,
+    CodeExecutionTool,
+    ComputerControlTool,
     GetCurrentDatetimeTool,
     ListDirectoryTool,
     ReadFileTool,
@@ -71,6 +73,8 @@ _TOOL_BLURBS = {
     "write_file": "Write or append to a file",
     "vision_analyze": "Analyze an image using Vision LLM",
     "web_scrape": "Deep scrape a webpage via Playwright",
+    "execute_python_code": "Execute Python in a secure sandbox",
+    "computer_control": "Control mouse and keyboard (Requires Approval)",
 }
 
 
@@ -93,6 +97,8 @@ def _build_orchestrator() -> tuple[Orchestrator, SessionStore, ToolRegistry]:
     registry.register(WriteFileTool())
     registry.register(VisionAnalyzeTool())
     registry.register(WebScrapeTool())
+    registry.register(CodeExecutionTool())
+    registry.register(ComputerControlTool())
 
     guard = PermissionGuard()
     orchestrator = Orchestrator(store, registry, guard)
@@ -149,6 +155,8 @@ def _print_help() -> None:
     table.add_row("/history", "Show this session's conversation")
     table.add_row("/voice", "Enter voice mode (speak with JARVIS)")
     table.add_row("/new", "Start a fresh session (clears context)")
+    table.add_row("/confirm", "Confirm a pending high-risk action")
+    table.add_row("/deny", "Deny a pending high-risk action")
     table.add_row("/quit", "Exit JARVIS")
 
     console.print()
@@ -307,6 +315,23 @@ def _chat_loop(
             get_vector_store().set_session(session_id)
             console.print()
             _print_session_banner(session_id, fresh=True)
+            continue
+            
+        if command == "/confirm" or command == "/deny":
+            with console.status("[cyan]Processing...[/cyan]", spinner="dots"):
+                try:
+                    response = orchestrator.handle_confirmation(session_id, command == "/confirm")
+                except Exception as e:
+                    console.print(f"\n[red]Error:[/red] {e}")
+                    continue
+            console.print()
+            console.print(Panel(
+                Markdown(response),
+                title="[bold cyan]JARVIS[/bold cyan]",
+                border_style="cyan",
+                padding=(1, 2),
+            ))
+            console.print()
             continue
 
         with console.status("[cyan]Thinking…[/cyan]", spinner="dots"):
