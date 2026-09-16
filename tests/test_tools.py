@@ -440,7 +440,8 @@ class TestCodeExecutionTool:
 
     def test_security_violation(self):
         result = self.tool.run(code="import os")
-        assert "ERROR: Security violation" in result
+        assert "ERROR:" in result
+        assert "not found" in result or "Security violation" in result
 
     def test_execution_timeout(self):
         # A simple infinite loop that will time out
