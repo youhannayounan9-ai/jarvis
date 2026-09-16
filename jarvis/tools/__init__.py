@@ -13,6 +13,8 @@ from jarvis.tools.file_reader import ReadFileTool
 from jarvis.tools.recall_facts import RecallFactsTool
 from jarvis.tools.registry import ToolRegistry
 from jarvis.tools.remember_fact import RememberFactTool
+from jarvis.tools.vision_analyze import VisionAnalyzeTool
+from jarvis.tools.web_scrape import WebScrapeTool
 from jarvis.tools.web_search import WebSearchTool
 from jarvis.tools.wikipedia_summary import WikipediaSummaryTool
 from jarvis.tools.write_file import WriteFileTool
@@ -29,4 +31,6 @@ __all__ = [
     "RememberFactTool",
     "RecallFactsTool",
     "WriteFileTool",
+    "VisionAnalyzeTool",
+    "WebScrapeTool",
 ]

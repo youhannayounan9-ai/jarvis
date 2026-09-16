@@ -46,6 +46,8 @@ from jarvis.tools import (
     RecallFactsTool,
     RememberFactTool,
     ToolRegistry,
+    VisionAnalyzeTool,
+    WebScrapeTool,
     WebSearchTool,
     WikipediaSummaryTool,
     WriteFileTool,
@@ -67,6 +69,8 @@ _TOOL_BLURBS = {
     "remember_fact": "Save a long-term memory fact",
     "recall_facts": "Search long-term memory",
     "write_file": "Write or append to a file",
+    "vision_analyze": "Analyze an image using Vision LLM",
+    "web_scrape": "Deep scrape a webpage via Playwright",
 }
 
 
@@ -87,6 +91,8 @@ def _build_orchestrator() -> tuple[Orchestrator, SessionStore, ToolRegistry]:
     registry.register(RememberFactTool())
     registry.register(RecallFactsTool())
     registry.register(WriteFileTool())
+    registry.register(VisionAnalyzeTool())
+    registry.register(WebScrapeTool())
 
     guard = PermissionGuard()
     orchestrator = Orchestrator(store, registry, guard)

@@ -1,9 +1,12 @@
 """
 ui/dashboard.py
 ───────────────
-Web UI Dashboard for JARVIS v0.5.0 using Streamlit.
+Web UI Dashboard for JARVIS v0.6.0 using Streamlit.
 Run with: streamlit run ui/dashboard.py
 """
+
+import os
+from pathlib import Path
 
 import streamlit as st
 from typing import Any
@@ -23,10 +26,12 @@ from jarvis.tools import (
     WebSearchTool,
     WikipediaSummaryTool,
     WriteFileTool,
+    VisionAnalyzeTool,
+    WebScrapeTool,
 )
 
 # ── Page Config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="JARVIS v0.5 Dashboard", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="JARVIS v0.6 Dashboard", page_icon="🧠", layout="wide")
 
 
 # ── Initialization ────────────────────────────────────────────────────────────
@@ -45,6 +50,8 @@ def get_jarvis_components():
     registry.register(CalculatorTool())
     registry.register(RememberFactTool())
     registry.register(RecallFactsTool())
+    registry.register(VisionAnalyzeTool())
+    registry.register(WebScrapeTool())
     
     guard = PermissionGuard()
     orchestrator = Orchestrator(store, registry, guard)
@@ -67,9 +74,27 @@ def start_new_session():
 
 
 # ── UI Layout ─────────────────────────────────────────────────────────────────
-st.sidebar.title("JARVIS v0.5 Dashboard")
+st.sidebar.title("JARVIS v0.6 Dashboard")
 st.sidebar.button("New Session", on_click=start_new_session)
 st.sidebar.caption(f"Current Session: `{st.session_state.session_id[:8]}...`")
+
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+uploaded_file = st.sidebar.file_uploader(
+    "Upload an image for JARVIS to see", 
+    type=["jpg", "png", "jpeg"],
+    key=f"uploader_{st.session_state.uploader_key}"
+)
+
+saved_file_path = None
+if uploaded_file is not None:
+    uploads_dir = Path("jarvis_data/uploads")
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    saved_file_path = (uploads_dir / uploaded_file.name).resolve()
+    with open(saved_file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.sidebar.success("Image uploaded successfully.")
 
 st.title("JARVIS Assistant")
 
@@ -90,6 +115,10 @@ for msg in chat_messages:
 
 # Chat Input
 if user_input := st.chat_input("How can I help you?"):
+    if saved_file_path is not None:
+        user_input += f"\n[Attached Image: {saved_file_path}]"
+        st.session_state.uploader_key += 1
+        
     with st.chat_message("user"):
         st.markdown(user_input)
     

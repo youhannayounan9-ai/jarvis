@@ -29,6 +29,7 @@ dependencies = [
     "sounddevice>=0.4.6",
     "numpy>=1.26.0",
     "streamlit>=1.30.0",
+    "playwright>=1.40.0",
 ]
 
 [project.optional-dependencies]

@@ -328,3 +328,69 @@ class TestToolRegistry:
         assert isinstance(schemas, list)
         assert len(schemas) == 1
         assert schemas[0]["type"] == "function"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# vision_analyze (mocked — no network or large models)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestVisionAnalyzeTool:
+    def setup_method(self):
+        from jarvis.tools.vision_analyze import VisionAnalyzeTool
+        self.tool = VisionAnalyzeTool()
+
+    def test_name(self):
+        assert self.tool.name == "vision_analyze"
+
+    def test_blocks_path_traversal(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("FILE_READER_ALLOWED_DIR", str(tmp_path))
+        import importlib, jarvis.config, jarvis.tools.vision_analyze
+        importlib.reload(jarvis.config)
+        importlib.reload(jarvis.tools.vision_analyze)
+        from jarvis.tools.vision_analyze import VisionAnalyzeTool as FreshTool
+        tool = FreshTool()
+        
+        result = tool.run(image_path="/etc/passwd")
+        assert "ERROR" in result
+        assert "denied" in result.lower()
+
+    def test_file_not_found(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("FILE_READER_ALLOWED_DIR", str(tmp_path))
+        import importlib, jarvis.config, jarvis.tools.vision_analyze
+        importlib.reload(jarvis.config)
+        importlib.reload(jarvis.tools.vision_analyze)
+        from jarvis.tools.vision_analyze import VisionAnalyzeTool as FreshTool
+        tool = FreshTool()
+        
+        result = tool.run(image_path=str(tmp_path / "nonexistent.jpg"))
+        assert "ERROR" in result
+        assert "not found" in result.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# web_scrape (mocked playwright)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWebScrapeTool:
+    def setup_method(self):
+        from jarvis.tools.web_scrape import WebScrapeTool
+        self.tool = WebScrapeTool()
+
+    def test_name(self):
+        assert self.tool.name == "web_scrape"
+
+    @patch("playwright.sync_api.sync_playwright")
+    def test_successful_scrape(self, mock_playwright):
+        mock_p = MagicMock()
+        mock_browser = MagicMock()
+        mock_page = MagicMock()
+        
+        mock_playwright.return_value.__enter__.return_value = mock_p
+        mock_p.chromium.launch.return_value = mock_browser
+        mock_browser.new_page.return_value = mock_page
+        mock_page.inner_text.return_value = "This is a mock webpage content."
+        
+        result = self.tool.run(url="https://example.com")
+        assert "This is a mock webpage content." in result
+        mock_page.goto.assert_called_with("https://example.com", timeout=20000)
+

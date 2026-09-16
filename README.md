@@ -2,15 +2,16 @@
 
 > A local, modular AI assistant — powered by Ollama. No paid APIs. No cloud.
 
-**JARVIS v0.5.0** — text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, and a clean modular architecture designed for progressive expansion.
+**JARVIS v0.6.0** — text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, Vision, Browser Automation, and a clean modular architecture designed for progressive expansion.
 
 ---
 
-## ✨ What's New in v0.5.0
+## ✨ What's New in v0.6.0
 
-- **Web UI Dashboard** — Run JARVIS in a beautiful browser interface using Streamlit (`ui/dashboard.py`).
-- **`write_file` Tool** — JARVIS can now write and append to files (safely sandboxed with strict permission guards).
-- **Improved Synthesis Brevity** — The orchestrator now forces concise, natural answers without repeating raw tool outputs.
+- **Vision Capability** — Upload images for JARVIS to analyze via `ollama_chat/llava` in the Web UI.
+- **Deep Web Scraping** — Playwright-powered `web_scrape` tool for reading full web pages directly.
+
+*Note: For these features to work, run `ollama pull llava` and `playwright install chromium`.*
 
 ---
 
@@ -18,7 +19,8 @@
 
 - 💬 **Conversational AI** — full session memory backed by SQLite
 - 🛠️ **Tool calling** — LLM can autonomously call tools to answer questions
-- 🔍 **Web search** — DuckDuckGo (free, no API key)
+- 🔍 **Web search & Scraping** — DuckDuckGo and Playwright browser integration
+- 👁️ **Vision** — Image understanding via Llava
 - 🕐 **Current time/date** — instant, no network
 - 📄 **Read/Write files** — sandboxed to your project directory
 - 🔒 **Fully local** — your data never leaves your machine
@@ -136,9 +138,9 @@ Or from the text REPL: type `/voice`.
 
 ---
 
-## Web UI Dashboard (v0.5)
+## Web UI Dashboard (v0.5+)
 
-To launch the beautiful browser interface with thought process observability, run:
+To launch the beautiful browser interface with thought process observability and image upload support, run:
 
 ```bash
 streamlit run ui/dashboard.py
@@ -292,7 +294,7 @@ In short: create a file in `jarvis/tools/`, subclass `BaseTool`, register it in 
 | **v0.3** | ✅ Plan-and-Execute multi-step agent loop |
 | **v0.4** | ✅ Voice input (Whisper) + voice output (Edge TTS) |
 | **v0.5** | ✅ Web UI (Streamlit) + write_file tool + synthesis polish |
-| v0.6 | Vision (image understanding) |
+| **v0.6** | ✅ Vision (image understanding) + Playwright web scrape |
 | v0.7 | Browser + computer automation (with permission model) |
 
 ---
