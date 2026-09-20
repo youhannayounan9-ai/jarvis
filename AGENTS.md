@@ -28,3 +28,8 @@ JARVIS is a local-first, multimodal, agentic AI assistant.
 - SQLite
 - Streamlit
 - Playwright
+
+## Intent Router Architecture & Trade-offs
+- **Mechanism:** Heuristic keyword + length matching (zero latency).
+- **Benefits:** Skips the heavy Plan-and-Execute loop for simple queries, saving ~2-3 LLM calls.
+- **Known Limitations (Edge Cases):** False Positives (complex queries containing simple keywords) and False Negatives (simple queries missing keywords). This is an intentional trade-off prioritizing speed and reduced token cost over perfect classification accuracy.

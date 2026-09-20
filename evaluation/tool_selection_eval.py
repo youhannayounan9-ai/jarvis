@@ -64,12 +64,12 @@ def run_evaluation():
                                 actual_tool = "None"
                                 
                             passed = (actual_tool == expected_tool)
-                            status = "✅" if passed else "❌"
+                            status = "PASS" if passed else "FAIL"
                             if not passed: all_passed = False
                             
                             print(f"{query[:30]:<30} | {expected_tool:<20} | {actual_tool:<20} | {status}")
                         except Exception as e:
-                            print(f"{query[:30]:<30} | {expected_tool:<20} | ERROR                | ❌")
+                            print(f"{query[:30]:<30} | {expected_tool:<20} | ERROR                | FAIL")
                             all_passed = False
 
     if not all_passed:

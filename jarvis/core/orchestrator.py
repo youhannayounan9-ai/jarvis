@@ -63,9 +63,16 @@ class Orchestrator:
 
     def route_intent(self, user_input: str) -> str:
         text = user_input.lower().strip()
+        
+        # Complexity triggers that override simple keywords
+        complex_triggers = ["and then", "also", "after that", "then", "next", "write a", "create a"]
+        if any(c in text for c in complex_triggers):
+            return "complex"
+            
         simple_keywords = [
             "what time", "time is it", "calculate", "hello", "hi", "hey",
-            "who are you", "+", "-", "*", "/", "search", "remember"
+            "who are you", "+", "-", "*", "/", "search", "remember",
+            "date", "today", "weather"
         ]
         if any(k in text for k in simple_keywords) and len(text) < 150:
             return "simple"
