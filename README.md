@@ -1,15 +1,15 @@
 # JARVIS
 
-> A local, modular AI assistant — powered by Ollama. No paid APIs. No cloud.
+> A **Local-first, privacy-oriented, and free of paid model APIs by default** AI assistant — powered by Ollama. No cloud.
 
-**JARVIS v0.8.0** — text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, Vision, Browser Automation, Computer Automation, Safe Code Execution, Advanced Permissions, and a clean modular architecture designed for progressive expansion.
+**JARVIS v0.8.0** — a **modular agentic AI prototype with production-oriented architecture**. It is a text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, Vision, Browser Automation, Computer Automation, Safe Code Execution, Advanced Permissions, and a clean modular architecture designed for progressive expansion.
 
 ---
 
 ## ✨ What's New in v0.8.0
 
 - 🖱️ **Computer Automation** — `computer_control` tool to automate mouse and keyboard actions safely via PyAutoGUI.
-- 🐍 **Safe Code Execution** — `execute_python_code` tool providing a safe, restricted sandbox to process data and math.
+- 🐍 **Safe Code Execution** — `execute_python_code` tool providing a **restricted Python execution environment (OS-level isolation planned)** to process data and math.
 - 🔐 **Advanced Permission System** — Confirmation flow for high-risk tools via CLI (`/confirm`, `/deny`) and the Web UI.
 - ⚡ **Performance Optimization** — Session store LRU caching and `web_search` TTL caching via `cachetools`.
 
@@ -19,11 +19,11 @@
 
 - 💬 **Conversational AI** — full session memory backed by SQLite
 - 🛠️ **Tool calling** — LLM can autonomously call tools to answer questions
-- 🔍 **Web search & Scraping** — DuckDuckGo and Playwright browser integration
+- 🔍 **Web search & Scraping** — DuckDuckGo and Playwright browser integration for **dynamic web browsing and extraction**
 - 👁️ **Vision** — Image understanding via Llava
 - 🕐 **Current time/date** — instant, no network
 - 📄 **Read/Write files** — sandboxed to your project directory
-- 🔒 **Fully local** — your data never leaves your machine
+- 🔒 **Fully local** — your data never leaves your machine, providing **local inference without remote API network latency**
 - 🏗️ **Modular** — adding a new tool takes ~30 lines
 - 🌐 **Web UI** — Streamlit-based interface with thought process observability
 
