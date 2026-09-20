@@ -61,6 +61,16 @@ class Orchestrator:
         self._planner = Planner(llm_client=chat_completion)
         self._pending_confirmations: dict[str, Any] = {}
 
+    def route_intent(self, user_input: str) -> str:
+        text = user_input.lower().strip()
+        simple_keywords = [
+            "what time", "time is it", "calculate", "hello", "hi", "hey",
+            "who are you", "+", "-", "*", "/", "search", "remember"
+        ]
+        if any(k in text for k in simple_keywords) and len(text) < 150:
+            return "simple"
+        return "complex"
+
     def chat(self, session_id: str, user_input: str) -> str:
         """
         Process one user message via Plan → Execute → Synthesize.
@@ -82,6 +92,27 @@ class Orchestrator:
             "are included for reference. Use them to resolve follow-ups."
         )
         context_cue = _build_context_cue(history, memory_cue)
+
+        # ── 1.5. Intent Routing ────────────────────────────────────────────────
+        intent = self.route_intent(user_input)
+        log.info("intent_routed", intent=intent, bypassed_planner=(intent == "simple"))
+
+        tool_schemas = self._registry.get_schemas()
+
+        if intent == "simple":
+            messages = [
+                {"role": "system", "content": settings.system_prompt},
+                {"role": "system", "content": memory_cue},
+                *history,
+                {"role": "user", "content": user_input},
+            ]
+            final_text, _ = self._run_react(
+                session_id=session_id,
+                messages=messages,
+                tool_schemas=tool_schemas,
+                max_rounds=2,
+            )
+            return final_text
 
         # ── 2. Plan phase ──────────────────────────────────────────────────────
         plan = self._planner.generate_plan(user_input, context_cue)

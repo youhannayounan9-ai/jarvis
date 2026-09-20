@@ -141,16 +141,19 @@ if user_input := st.chat_input("How can I help you?"):
 
 pending = orchestrator.get_pending_confirmation(st.session_state.session_id)
 if pending:
-    st.warning(f"⚠️ This action requires your confirmation: **{pending['tool_name']}**")
-    st.code(pending['tool_args'])
+    st.error("⚠️ HIGH-RISK ACTION REQUIRES APPROVAL")
+    st.markdown(f"**Tool:** `{pending['tool_name']}`\n\n**Risk Level:** `{pending['risk_level']}`")
+    st.markdown("**Arguments:**")
+    st.code(pending['tool_args'], language="json")
+    
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Confirm", type="primary"):
+        if st.button("✅ Approve Action", type="primary"):
             response = orchestrator.handle_confirmation(st.session_state.session_id, True)
             st.success(response)
             st.rerun()
     with col2:
-        if st.button("Deny"):
+        if st.button("❌ Deny Action"):
             response = orchestrator.handle_confirmation(st.session_state.session_id, False)
             st.error(response)
             st.rerun()
