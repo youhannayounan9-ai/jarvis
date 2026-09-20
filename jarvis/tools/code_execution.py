@@ -150,6 +150,9 @@ class CodeExecutionTool(BaseTool):
         _, exc = _run_with_timeout(execute, timeout_sec=5.0)
 
         if exc:
+            if isinstance(exc, (NameError, AttributeError, ImportError)):
+                log.error("code_execution_security_violation", error=str(exc))
+                return "ERROR: Security violation: Restricted function or module blocked."
             log.error("code_execution_failed", error=str(exc))
             if isinstance(exc, TimeoutError):
                 return f"ERROR: {exc}"

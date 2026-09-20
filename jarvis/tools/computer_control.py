@@ -55,11 +55,14 @@ class ComputerControlTool(BaseTool):
     risk_level = "SYSTEM"
     timeout_seconds = 10.0
 
+    def __init__(self):
+        super().__init__()
+        import pyautogui
+        pyautogui.FAILSAFE = True
+
     def run(self, action: str, **kwargs: Any) -> str:
         try:
             import pyautogui
-            # Failsafe: moving mouse to a corner aborts PyAutoGUI
-            pyautogui.FAILSAFE = True
             
             x = kwargs.get("x")
             y = kwargs.get("y")
@@ -67,7 +70,7 @@ class ComputerControlTool(BaseTool):
             key = kwargs.get("key")
             amount = kwargs.get("amount")
 
-            log.info("computer_control_start", action=action, kwargs=kwargs)
+            log.info("computer_control_executing", action=action, params=kwargs)
 
             # Execution logic
             if action == "move_mouse":
@@ -109,6 +112,9 @@ class ComputerControlTool(BaseTool):
             log.info("computer_control_success", action=action)
             return f"Successfully executed action: {action}"
 
+        except pyautogui.FailSafeException:
+            log.warning("computer_control_failsafe_triggered", action=action)
+            return "ERROR: Execution aborted by user failsafe."
         except Exception as e:
             log.error("computer_control_error", action=action, error=str(e))
             return f"ERROR: Computer control failed. {e}"

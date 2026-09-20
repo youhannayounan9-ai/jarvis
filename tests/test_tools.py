@@ -421,6 +421,13 @@ class TestComputerControlTool:
         assert "Successfully executed action: type_text" in result
         mock_write.assert_called_with("hello", interval=0.01)
 
+    @patch("pyautogui.moveTo")
+    @patch("time.sleep")
+    @patch("jarvis.tools.computer_control.log.info")
+    def test_failsafe_logging(self, mock_log_info, mock_sleep, mock_moveTo):
+        self.tool.run(action="move_mouse", x=100, y=200)
+        mock_log_info.assert_any_call("computer_control_executing", action="move_mouse", params={'x': 100, 'y': 200})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # code_execution (sandbox checks)
@@ -440,8 +447,7 @@ class TestCodeExecutionTool:
 
     def test_security_violation(self):
         result = self.tool.run(code="import os")
-        assert "ERROR:" in result
-        assert "not found" in result or "Security violation" in result
+        assert "ERROR: Security violation" in result
 
     def test_execution_timeout(self):
         # A simple infinite loop that will time out
