@@ -45,6 +45,7 @@ import subprocess  # noqa: S404 - only used to invoke the docker CLI, never shel
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,6 +89,10 @@ class ExecutionResult:
     #   "host_kill" - host timeout fired AND docker was told to stop/remove
     #                 the container afterwards (termination enforced)
     timeout_layer: str | None = None
+    # v0.17: name of the container that served this execution (empty when the
+    # run never started). Logged and reported so failures identify the exact
+    # container; concurrent executions each get their own name.
+    container_name: str = ""
 
     def to_report(self) -> str:
         """Human/LLM-readable summary of the execution."""
@@ -188,10 +193,11 @@ class DockerCodeSandbox(CodeSandbox):
     # so layer B (container timeout) normally reports first; layer A exists
     # only as defense against a hung CLI/daemon.
     HOST_TIMEOUT_SLACK_SECONDS = 5.0
-    # Fixed container name so a layer-A timeout can target `docker rm -f`.
-    # Uniqueness per host is acceptable: execution is serialized by the
-    # per-session lock and enabling the sandbox is an explicit operator act.
-    CONTAINER_NAME = "jarvis-sbx-exec"
+    # v0.17: per-execution container identity. Every run gets
+    # ``jarvis-sbx-<random>`` so concurrent executions cannot collide and a
+    # timeout cleanup targets exactly one container. (v0.16 and earlier used
+    # one fixed name, which serialized all executions on a host.)
+    CONTAINER_NAME_PREFIX = "jarvis-sbx"
 
     def __init__(self, image: str | None = None) -> None:
         # Distinguish None (use default) from "" (invalid — fail closed).
@@ -296,6 +302,9 @@ class DockerCodeSandbox(CodeSandbox):
             raise DockerUnavailableError("docker CLI not found")
 
         script_path = self._materialize_script(request.code)
+        # Unique per-execution container name: never derived from user or
+        # model input (safe charset; server-generated randomness).
+        container_name = f"{self.CONTAINER_NAME_PREFIX}-{uuid.uuid4().hex[:12]}"
         try:
             if not self._image_available():
                 raise DockerUnavailableError(
@@ -303,10 +312,17 @@ class DockerCodeSandbox(CodeSandbox):
                     "(pre-pull required; sandbox never pulls at runtime)"
                 )
 
+            log.info(
+                "sandbox_container_start",
+                container_name=container_name,
+                image=self.image,
+                timeout_seconds=request.timeout_seconds,
+            )
             cmd = [
                 docker_bin,
                 "run",
                 "--rm",                       # one-shot container
+                "--name", container_name,     # unique identity (v0.17)
                 "--network", "none",          # no network in or out
                 "--read-only",                # immutable root filesystem
                 "--tmpfs", f"/tmp:{self.TMPFS_MODE}",
@@ -337,14 +353,15 @@ class DockerCodeSandbox(CodeSandbox):
                 )
             except subprocess.TimeoutExpired:
                 # Layer A fired before the container reported. Stop waiting is
-                # not enough — enforce layer C: remove the container so the
-                # workload cannot keep running.
-                self._force_remove_container()
+                # not enough — enforce layer C: remove THIS container so the
+                # workload cannot keep running (other executions unaffected).
+                self._force_remove_container(container_name)
                 return ExecutionResult(
                     ok=False,
                     timed_out=True,
                     denial_reason="timeout",
                     timeout_layer="host_kill",
+                    container_name=container_name,
                 )
 
             stdout = proc.stdout[: request.max_output_bytes].decode(
@@ -362,6 +379,13 @@ class DockerCodeSandbox(CodeSandbox):
             container_timed_out = proc.returncode == self.CONTAINER_TIMEOUT_EXIT_CODE
             _ = host_deadline  # documented above; kept for clarity
 
+            log.info(
+                "sandbox_container_done",
+                container_name=container_name,
+                exit_code=proc.returncode,
+                timed_out=container_timed_out,
+            )
+
             return ExecutionResult(
                 ok=proc.returncode == 0,
                 stdout=stdout,
@@ -372,6 +396,7 @@ class DockerCodeSandbox(CodeSandbox):
                 timeout_layer=("container" if container_timed_out else None),
                 # A container-killed workload is a timeout, not an error.
                 denial_reason=("timeout" if container_timed_out else None),
+                container_name=container_name,
             )
         finally:
             # Best-effort cleanup of the host-side temp script. Inside the
@@ -381,23 +406,28 @@ class DockerCodeSandbox(CodeSandbox):
             except OSError:
                 pass
 
-    def _force_remove_container(self) -> None:
+    def _force_remove_container(self, container_name: str) -> None:
         """
         Layer-C enforcement helper: stop and remove a container that outlived
         the host-side wait. Best effort — any failure here is logged and
-        swallowed (the denial result is already decided).
+        swallowed (the denial result is already decided). Targets exactly the
+        named container; concurrent executions are never affected.
         """
         docker_bin = shutil.which("docker")
         if docker_bin is None:  # pragma: no cover - checked before run
             return
         try:
             subprocess.run(
-                [docker_bin, "rm", "-f", self.CONTAINER_NAME],
+                [docker_bin, "rm", "-f", container_name],
                 capture_output=True,
                 timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired) as e:  # pragma: no cover
-            log.error("sandbox_force_remove_failed", error=str(e))
+            log.error(
+                "sandbox_force_remove_failed",
+                container_name=container_name,
+                error=str(e),
+            )
 
     @staticmethod
     def _materialize_script(code: str) -> str:

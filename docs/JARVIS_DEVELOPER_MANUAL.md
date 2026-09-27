@@ -145,13 +145,47 @@ Concrete lifecycle — `calculator` with `expression="12 * (4 + 3) / 2.5"`:
 
 Restart behavior: state is entirely in SQLite. Kill the process after "pending"; restart; `handle_confirmation` loads the row, and the resume path (`_resume_paused_turn`) restores `original_request`, `pending_plan`, `completed_steps`, `remaining_rounds`, and mode from `context_json`. Legacy rows without context (pre-v0.15) degrade to a plain reply; corrupt `context_json` degrades safely; expired rows (TTL 10 min) are refused. Covered by `tests/test_confirmation_continuation.py` + `test_confirmations.py` + `test_security_critical.py`.
 
+### Execution ledger (v0.17) — at-most-once automatic dispatch
+
+Every protected execution now carries a durable identity and state machine in SQLite (`action_executions`, paired 1:1 with its `pending_confirmations` row inside one transaction):
+
+```
+        action_id = uuid4 (server-generated, survives restart)
+                          │
+  confirmation parked ────┴──→ PENDING
+                                 │
+              approve ┌──────────┼───────────── deny/supersede ──→ FAILED (attempt stays 0)
+                      ▼          ▼
+                claim (atomic UPDATE on state='PENDING')
+                      │ winner: PENDING→RUNNING, owner stamped
+                      │ losers: "already_running" refusal / terminal report
+                      ▼
+                registry.dispatch  (the ONLY path that reaches the tool)
+                      │
+           ok ────────┴─────── error
+           ▼                    ▼
+       SUCCEEDED              FAILED  (result durably recorded)
+
+  crash between dispatch and result record ──→ UNKNOWN (startup sweep RUNNING→UNKNOWN)
+```
+
+Semantics that matter:
+
+- **PENDING** = eligible to execute. **RUNNING** = claimed and dispatching. **SUCCEEDED/FAILED** = outcome durably recorded (repeated approvals return the recorded result, never re-dispatch). **UNKNOWN** = the side effect may or may not have happened — *never* automatically re-executed; `handle_confirmation` returns an `ACTION_EXECUTION_STATE_UNKNOWN` report directing the user to resolve explicitly (e.g., re-issue the request as a new action).
+- The claim is a single conditional `UPDATE ... WHERE state='PENDING'` judged by rowcount — two processes, two threads, two requests: exactly one winner. Duplicate approvals after a terminal state return the recorded result; empty pop returns a duplicate-resolution report built from the last ledger outcome.
+- A crash after claim but before result cannot strand RUNNING silently: the next startup sweeps RUNNING→UNKNOWN (`recover_unknown_action_executions`). During runtime, a dispatch exception transitions RUNNING→FAILED (a known error is a known result).
+- **Honesty rule:** the ledger makes automatic dispatch at-most-once. It does NOT make the external side effect exactly-once — the tool's effect is not transactionally coupled to SQLite. UNKNOWN exists precisely because that gap is real.
+- Legacy rows (pre-v0.17, no ledger row) fall back to the historical direct dispatch with a warning.
+
+Tests: `tests/test_action_idempotency.py` (24 cases: atomic claims incl. an 8-thread barrier race, duplicate/triple approval, approval-after-failure, UNKNOWN never re-dispatched, denial attempts 0, restart between park and approval, migration backfill) and the concurrent-approval cases in `tests/test_session_concurrency.py`.
+
 ---
 
 ## 9. Memory Architecture
 
 | Store | Tech | What lives there |
 |---|---|---|
-| Session state | SQLite (WAL) via `SessionStore` | Sessions, messages (full fidelity incl. tool payloads), pending confirmations |
+| Session state | SQLite (WAL) via `SessionStore` | Sessions, messages (full fidelity incl. tool payloads), pending confirmations, execution ledger (`action_executions`), session leases (`session_leases`), rate-limit events (`rate_limit_events`, only when the durable limiter is enabled) |
 | Long-term semantic | ChromaDB via `VectorStore` (`all-MiniLM-L6-v2` local embeddings, cosine HNSW) | Facts written by `remember_fact`, searched by `recall_facts` (top-3) |
 
 - **Session vs long-term:** session history = current conversation window; long-term = cross-session facts tied to `current_session_id` metadata. `VectorStore` is a process-wide singleton; `JarvisRuntime.start_session()` binds each new session to it.
@@ -212,7 +246,9 @@ Three timeout layers:
 
 1. **Container workload timeout** — the entrypoint is `timeout <cap>s python3 script.py`; a runaway snippet is killed *inside* the container (exit 124). This is the primary enforcement point (the workload boundary).
 2. **Host subprocess timeout** — `subprocess.run(..., timeout=cap+5)` backs the host out of a hung CLI/daemon call.
-3. **Force removal** — if the host wait fires, `docker rm -f jarvis-sbx-exec` guarantees no orphan container keeps consuming resources. `ExecutionResult.timeout_layer` reports `container` / `host_kill` / none.
+3. **Force removal** — if the host wait fires, `docker rm -f <container>` guarantees no orphan container keeps consuming resources. `ExecutionResult.timeout_layer` reports `container` / `host_kill` / none.
+
+**Per-run container identity (v0.17):** every execution runs in a container named `jarvis-sbx-<12-hex-random>` (prefix `DockerCodeSandbox.CONTAINER_NAME_PREFIX`), generated server-side and reported on `ExecutionResult.container_name` plus the `sandbox_container_start` / `sandbox_container_done` log events. The v0.16 fixed name (`jarvis-sbx-exec`) serialized all executions on a host and made cleanup ambiguous under concurrency; force-removal now targets exactly the named container, so a timed-out run can never affect another run's container.
 
 Every restriction and its reason:
 
@@ -228,6 +264,9 @@ Every restriction and its reason:
 | tmpfs `/tmp` 16 MB `noexec,nosuid,nodev` | Scratch space without execution/persistence |
 | code mounted `:ro` | The script can't rewrite itself |
 | `--rm` | One-shot; nothing lingers |
+| per-run random name (`jarvis-sbx-*`, v0.17) | Concurrent executions isolated; cleanup targets exactly one container |
+
+**Seccomp posture (v0.17, CONFIRMED against the live engine):** JARVIS does not weaken, replace, or opt out of Docker's seccomp filtering — no `--security-opt seccomp=unconfined`, no custom profile is passed. Containers therefore run under the daemon's **builtin default seccomp profile**, verified live: `docker info --format '{{json .SecurityOptions}}'` → `["name=seccomp,profile=builtin","name=cgroupns"]`. The builtin profile blocks ~44 of ~300 syscalls (including `keyctl`, `ptrace`, `kexec_load`, mount, and reboot families) and returns `EPERM` for ~26 more. This is default-profile containment on top of `--cap-drop ALL` + `no-new-privileges`; a custom minimized profile remains future work (see §26).
 | fixed container name | Prevents parallel-run pileups on one host |
 
 **Digest pinning:** `deploy/Dockerfile.sandbox` FROM-pins `python:3.12-slim@sha256:f77ac9e4…` — resolved by an actual `docker pull` against a real Linux daemon (v0.16) and re-verified by digest-ref pull + build. Never invent a digest; the build script refuses the placeholder.
@@ -243,11 +282,11 @@ Every restriction and its reason:
 - **FastAPI** app (`jarvis/api/app.py`); runtime built lazily and swappable (`set_runtime`) for tests.
 - **Sessions:** just IDs — all state in SQLite, so the API layer is stateless.
 - **Auth:** optional key (`JARVIS_API_KEY`); Bearer or X-API-Key; exempt: `/health`, `/docs`, `/openapi.json`, `/redoc`; constant-time `hmac.compare_digest`; whitespace-only key → 503 fail-closed.
-- **Rate limit:** in-process sliding window (`api/ratelimit.py`), keyed by API key or client IP; 429 + Retry-After; /health exempt. **Per-process.**
+- **Rate limit:** sliding window (`api/ratelimit.py`), keyed by API key or client IP; 429 + Retry-After; /health exempt. Two interchangeable backends behind one class (v0.17): the default in-memory deque (per-process) and — opt-in via `make_durable_limiter(store)` — an SQLite-backed store where each check is one `BEGIN IMMEDIATE` write transaction, so multiple JARVIS processes on the same database enforce ONE limit per client (bounded growth: expired events deleted in-transaction). The deployment default remains in-memory; see deploy/README.md.
 - **Request IDs:** middleware generates per-request UUID → `X-Request-ID` header, echoed in `/chat` bodies; errors are sanitized (generic message + correlation ID; details only in logs).
 - **SSE:** `POST /chat/stream` runs the turn in a worker thread; lifecycle events flow through a queue to the client *as they happen*; 15s keepalive comments defeat proxy idle timeouts; in-band `error` events; `X-Accel-Buffering: no`.
 - **Health:** `/health` = liveness + **deep DB read/write probe** (fail-closed 503 on persistence failure; probe rows self-clean).
-- **Per-session serialization:** one turn per session at a time; second concurrent turn → 409. Runtime-local (in-process locks) — **single-process assumption**, documented; multi-worker deployments need external locking (see deploy/README).
+- **Per-session serialization (v0.17: two layers):** one turn per session at a time; second concurrent turn → 409. Layer 1 is the runtime-local per-session mutex (fast path). Layer 2 is a **database-backed session lease** (`session_leases` table, TTL `SESSION_LEASE_TTL_SECONDS`=300 s, monotonically increasing fencing token bumped on stale takeover): cross-process exclusivity over the same SQLite file, no Redis required. A crashed owner's lease expires (no indefinite lock); releases/renewals are owner-checked; the documented residual race is a single turn that outlives the TTL near the boundary.
 - **Client:** `jarvis/api/client.py` — stdlib-only (`urllib`), typed errors (`SessionConflict`, `RateLimitedError`), SSE iterator; used by the dashboard and scripts.
 
 ---
@@ -405,12 +444,15 @@ Extra levers: `python -m jarvis.maintenance doctor` (DB, Ollama, sandbox posture
 
 ---
 
-## 26. Known Architectural Limitations (v0.16)
+## 26. Known Architectural Limitations (v0.17)
 
-- **Single-process state:** rate limiting, per-session locks, ChromaDB singleton — no multi-replica safety. Run one process; enforce limits at a reverse proxy otherwise.
+- **SQLite is the coordination substrate:** session leases, the execution ledger, and the durable rate limiter are correct across processes sharing ONE database file, but SQLite writes serialize — high-write concurrency throughput is bounded. Not a distributed system: replicas on different files do not coordinate.
+- **Lease TTL residual race:** a single turn that outlives `SESSION_LEASE_TTL_SECONDS` (300 s) can lose cross-process exclusivity near the TTL boundary (in-process mutex still holds). Turn durations are far below the TTL today.
+- **UNKNOWN resolution is manual by design:** an action whose crash state is UNKNOWN is reported (`ACTION_EXECUTION_STATE_UNKNOWN`) and never auto-rerun; the user re-issues it deliberately. No UI for curating UNKNOWN actions exists yet.
+- **Durable rate limiter is opt-in:** the deployment default limiter stays in-memory; `make_durable_limiter(store)` exists for multi-process deployments (see deploy/README.md).
 - **Lexical graders:** no semantic judge; pass ≠ correct.
 - **Prompt-injection defense:** prompt rules are defense-in-depth only; the structural boundary is permissions/confirmation, and within allowed tools a 7B model can still be steered by crafted content.
-- **Sandbox profile:** no seccomp/apparmor profile; fixed container name (`jarvis-sbx-exec`) prevents parallel executions on one daemon; CPU limit is quota-based (not hard wall); verification is single-machine.
+- **Sandbox:** seccomp is Docker's builtin default profile (verified — no weakening, but also not minimized/custom); CPU limit is quota-based (not hard wall); container-name uniqueness is random 12-hex (collision-chance only, same as docker default naming); verification is single-machine.
 - **Windows sandbox availability:** sandbox refuses win32 hosts even with a working Linux engine (verified); code execution requires WSL2/Linux.
 - **FILE_WRITE blocked:** write_file registered but refused — writes need a deliberate design change (e.g., scoped workspace + confirmation), not just a flag.
 - **Local-only evaluation signal:** nightly evals need the self-hosted Ollama runner; live results vary with model/hardware.

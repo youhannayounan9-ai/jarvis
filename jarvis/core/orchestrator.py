@@ -24,7 +24,14 @@ from jarvis.core.permissions import PermissionGuard
 from jarvis.core.planner import Planner
 from jarvis.llm.client import chat_completion
 from jarvis.memory.context_manager import ContextManager, estimate_tokens
-from jarvis.memory.session_store import SessionStore
+from jarvis.memory.session_store import (
+    ACTION_STATE_FAILED,
+    ACTION_STATE_PENDING,
+    ACTION_STATE_SUCCEEDED,
+    ACTION_STATE_UNKNOWN,
+    SessionStore,
+    new_owner_token,
+)
 from jarvis.tools.registry import ToolRegistry
 from jarvis.utils.logging import get_logger
 
@@ -354,34 +361,53 @@ class Orchestrator:
         Resolve the session's pending high-risk action and RESUME the paused
         turn when a durable resume context exists.
 
-        Flow (approve): pop the confirmation → dispatch the tool → persist
-        the tool result as a `tool` message → restore the pause context →
-        execute remaining plan steps → synthesize a final answer.
+        Flow (approve): pop the confirmation → claim the action's execution-
+        ledger row (at-most-once) → dispatch the tool → persist the result
+        as a `tool` message → restore the pause context → execute remaining
+        plan steps → synthesize a final answer.
 
-        Flow (deny): persist a denial tool message → restore context and
-        continue, so the agent can explain what was NOT done and still
-        deliver the rest of the original request.
+        Flow (deny): record the denial in the ledger (no execution attempt)
+        → persist a denial tool message → restore context and continue, so
+        the agent can explain what was NOT done and still deliver the rest
+        of the original request.
+
+        Duplicate safety (v0.17): the confirmation pop and the ledger claim
+        are both atomic, so two concurrent approvals cannot both dispatch;
+        a repeat approval after the action reached a terminal state reports
+        the recorded outcome instead of re-executing; an UNKNOWN action
+        (possible execution whose result was never durably recorded) is
+        never automatically re-executed.
 
         States handled: approval, denial, tool failure (the error flows into
         synthesis like any other tool error), expired confirmation (None →
-        plain message), missing/corrupt context (legacy rows → behave like
-        the pre-v0.15 raw-result reply), and restart between park and
-        resolve (everything needed is in SQLite).
+        plain message), duplicate resolution (last recorded outcome is
+        reported), missing/corrupt context (legacy rows → behave like the
+        pre-v0.15 raw-result reply), and restart between park and resolve
+        (everything needed is in SQLite).
         """
         pending = self._store.complete_pending_confirmation(session_id)
         if not pending:
-            return "No pending actions to confirm or deny."
+            return self._duplicate_resolution_report(session_id)
 
         tool_name = pending["tool_name"]
         tool_args = pending["tool_args"]
         tool_call_id = pending["tool_call_id"]
         context = pending.get("context") or {}
+        confirmation_id = str(pending.get("confirmation_id") or "")
 
         # ── 1. Resolve the action itself (never raises) ────────────────────
         if not confirmed:
             result = f"User denied execution of {tool_name}."
+            self._record_denial(confirmation_id, tool_name, result)
         else:
-            result = self._registry.dispatch(tool_name, tool_args)  # ERROR:... on failure
+            result, action_id, ambiguous = self._execute_protected_action(
+                session_id, confirmation_id, tool_name, tool_args
+            )
+            if ambiguous:
+                # Crash ambiguity: the side effect may or may not have
+                # happened. Never auto-retry; never resume the plan on a
+                # guessed result. State is visible in the ledger.
+                return self._unknown_action_report(session_id, action_id, tool_name)
 
         tool_result_message: dict[str, Any] = {
             "role": "tool",
@@ -400,6 +426,148 @@ class Orchestrator:
             return f"{verb} {tool_name}. Result: {result}"
 
         return self._resume_paused_turn(session_id, context, tool_name, result, confirmed)
+
+    # ── Action ledger integration (v0.17) ──────────────────────────────────
+
+    def _execute_protected_action(
+        self,
+        session_id: str,
+        confirmation_id: str,
+        tool_name: str,
+        tool_args: str,
+    ) -> tuple[str, str | None, bool]:
+        """
+        Dispatch a protected action at-most-once via the execution ledger.
+
+        Returns:
+            (result, action_id, ambiguous)
+
+            - ``claimed``: the caller owns the single execution attempt; the
+              tool was dispatched and the outcome (SUCCEEDED/FAILED) durably
+              recorded before returning.
+            - ``already_running``: another resolver owns the attempt; a clear
+              message is returned and nothing is dispatched here.
+            - terminal states: the recorded outcome is returned instead of
+              re-executing. ``ambiguous=True`` (UNKNOWN state) means the side
+              effect may already have happened — the caller must not resume
+              the turn automatically.
+        """
+        action = (
+            self._store.get_action_execution_by_confirmation(confirmation_id)
+            if confirmation_id
+            else None
+        )
+        if action is None:
+            # Legacy row parked before v0.17 (no ledger pair): historical
+            # direct-dispatch behavior. New parks always have a ledger row.
+            log.warning(
+                "action_ledger_missing_legacy_dispatch",
+                session_id=session_id,
+                tool_name=tool_name,
+            )
+            return self._registry.dispatch(tool_name, tool_args), None, False
+
+        owner = new_owner_token("action")
+        claim = self._store.claim_action_execution(action.action_id, owner)
+        log.info(
+            "action_claim_result",
+            session_id=session_id,
+            action_id=action.action_id,
+            tool=tool_name,
+            claim=claim,
+        )
+
+        if claim == "claimed":
+            try:
+                result = self._registry.dispatch(tool_name, tool_args)  # ERROR:... on failure
+            except Exception as e:  # a crash here must never strand RUNNING
+                result = f"ERROR: dispatch raised {type(e).__name__}: {e}"
+            state = (
+                ACTION_STATE_FAILED
+                if _is_tool_error(result)
+                else ACTION_STATE_SUCCEEDED
+            )
+            self._store.finish_action_execution(action.action_id, state, result)
+            return result, action.action_id, False
+
+        if claim == "already_running":
+            # Defense in depth: the atomic confirmation pop should normally
+            # make this unreachable, but a second resolver (or a crashed
+            # claim that recovery has not yet swept) must not double-run.
+            return (
+                f"ERROR: Action '{tool_name}' is already being executed by "
+                "another request; no duplicate dispatch was performed.",
+                action.action_id,
+                False,
+            )
+
+        state = claim.split(":", 1)[1]
+        current = self._store.get_action_execution(action.action_id) or action
+        if state == ACTION_STATE_UNKNOWN:
+            log.warning(
+                "action_blocked_unknown_state",
+                session_id=session_id,
+                action_id=action.action_id,
+                tool=tool_name,
+            )
+            return "", action.action_id, True
+
+        # SUCCEEDED / FAILED: report the durably recorded outcome, no rerun.
+        word = "succeeded" if state == ACTION_STATE_SUCCEEDED else "failed"
+        recorded = str(current.result or "(no result recorded)")
+        return (
+            f"[Action already {word}; recorded result] {recorded}",
+            action.action_id,
+            False,
+        )
+
+    def _record_denial(self, confirmation_id: str, tool_name: str, result: str) -> None:
+        """Close the ledger row for a denied action (no execution attempt)."""
+        if not confirmation_id:
+            return
+        action = self._store.get_action_execution_by_confirmation(confirmation_id)
+        if action is not None and action.state == ACTION_STATE_PENDING:
+            self._store.finish_action_execution(action.action_id, ACTION_STATE_FAILED, result)
+            log.info(
+                "action_denied",
+                action_id=action.action_id,
+                tool=tool_name,
+            )
+
+    def _duplicate_resolution_report(self, session_id: str) -> str:
+        """Deterministic response when there is nothing left to resolve."""
+        last = self._store.get_last_action_execution(session_id)
+        if last is None:
+            return "No pending actions to confirm or deny."
+        if last.state == ACTION_STATE_UNKNOWN:
+            return self._unknown_action_report(session_id, last.action_id, last.tool_name)
+        if last.state == ACTION_STATE_SUCCEEDED:
+            return (
+                f"No pending actions. The most recent protected action "
+                f"({last.tool_name}) already succeeded and was not executed "
+                f"again. Recorded result: {str(last.result or '')[:500]}"
+            )
+        if last.state == ACTION_STATE_FAILED:
+            return (
+                f"No pending actions. The most recent protected action "
+                f"({last.tool_name}) did not execute successfully "
+                f"(state: FAILED); it was not re-executed. "
+                f"Recorded outcome: {str(last.result or '')[:500]}"
+            )
+        return "No pending actions to confirm or deny."
+
+    def _unknown_action_report(self, session_id: str, action_id: str | None, tool_name: str) -> str:
+        """User-facing status for crash-ambiguous (UNKNOWN) actions."""
+        aid = f" (action {action_id})" if action_id else ""
+        return (
+            f"ACTION_EXECUTION_STATE_UNKNOWN{aid}: '{tool_name}' may or may "
+            "not have executed before an interruption, and its result was "
+            "never durably recorded. To prevent a duplicate side effect, "
+            "automatic retry was prevented and the paused task was not "
+            "resumed. Inspect the ledger row and resolve explicitly "
+            "(re-issue the original request when you have confirmed the "
+            "external state)."
+        )
 
     def _resume_paused_turn(
         self,
@@ -816,14 +984,21 @@ class Orchestrator:
                 tool=tool_name,
                 risk_level=risk_level,
             )
-            self._store.save_pending_confirmation(
+            pause_ctx = {**({} if pause_context is None else pause_context),
+                         "mode": self._current_mode}
+            confirmation_id = self._store.save_pending_confirmation(
                 session_id=session_id,
                 tool_name=tool_name,
                 tool_args=tool_args,
                 tool_call_id=tool_call_id,
                 risk_level=risk_level,
-                context={**({} if pause_context is None else pause_context),
-                         "mode": self._current_mode},
+                context=pause_ctx,
+            )
+            log.info(
+                "action_parked",
+                session_id=session_id,
+                tool=tool_name,
+                confirmation_id=confirmation_id,
             )
             return PAUSED_FOR_CONFIRMATION
 

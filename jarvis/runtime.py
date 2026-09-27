@@ -27,7 +27,7 @@ from jarvis.config import settings
 from jarvis.core.orchestrator import Orchestrator
 from jarvis.core.permissions import PermissionGuard
 from jarvis.core.sandbox import DockerCodeSandbox
-from jarvis.memory.session_store import SessionStore
+from jarvis.memory.session_store import SessionStore, new_owner_token
 from jarvis.memory.vector_store import get_vector_store
 from jarvis.tools import (
     CalculatorTool,
@@ -112,6 +112,8 @@ class JarvisRuntime:
     # Locks are created lazily per session; the map itself is guarded.
     _session_locks: dict[str, threading.Lock] = field(default_factory=dict)
     _session_locks_guard: threading.Lock = field(default_factory=threading.Lock)
+    # v0.17: durable identity of THIS runtime instance for session leases.
+    owner_token: str = field(default_factory=lambda: new_owner_token("runtime"))
 
     @contextmanager
     def _exclusive_session(self, session_id: str) -> Iterator[None]:
@@ -122,6 +124,10 @@ class JarvisRuntime:
         raise TimeoutError immediately so the caller can return 409 Conflict
         instead of interleaving history or queueing an unbounded wait.
         Different sessions never contend.
+
+        v0.17: this in-process mutex is now the FAST layer; cross-process
+        exclusion is provided by the database-backed session lease acquired
+        inside it (see chat / handle_confirmation).
         """
         with self._session_locks_guard:
             lock = self._session_locks.setdefault(session_id, threading.Lock())
@@ -131,6 +137,24 @@ class JarvisRuntime:
             yield
         finally:
             lock.release()
+
+    def _acquire_session_lease_or_busy(self, session_id: str) -> int:
+        """
+        Acquire the database-backed session lease or raise TimeoutError.
+
+        Returns the fencing token. Raises TimeoutError when another live
+        owner holds the lease (mapped to HTTP 409 by the API layer). The
+        lease expires after SESSION_LEASE_TTL_SECONDS, so a crashed owner
+        cannot lock a session forever.
+        """
+        acquired, fencing = self.store.acquire_session_lease(
+            session_id, self.owner_token
+        )
+        if not acquired:
+            raise TimeoutError(
+                f"session {session_id} is busy processing another turn"
+            )
+        return fencing
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -149,18 +173,49 @@ class JarvisRuntime:
         Keyword args (e.g. ``on_event`` for step observation) forward to the
         orchestrator unchanged.
 
+        Concurrency: guarded by BOTH the in-process per-session mutex (fast
+        path) and a database-backed session lease (multi-process safety).
+        The lease is released when the turn finishes; a crashed process's
+        lease expires after SESSION_LEASE_TTL_SECONDS so the session can
+        recover. Residual race (documented): a single turn that outlives the
+        lease TTL may lose cross-process exclusivity near the TTL boundary.
+
         Raises:
             TimeoutError: if another turn is already in flight for this
-                session (callers should map this to HTTP 409). Only runtime-
-                local concurrency is serialized; multi-process deployments
-                need an external lock (see deploy/README.md).
+                session, in this process (mutex) or another process sharing
+                the database (lease). Callers map this to HTTP 409.
         """
         with self._exclusive_session(session_id):
-            return self.orchestrator.chat(session_id, user_input, **kwargs)
+            self._acquire_session_lease_or_busy(session_id)
+            try:
+                return self.orchestrator.chat(session_id, user_input, **kwargs)
+            finally:
+                # Release even on failure so one error never wedges the
+                # session until the TTL. (Best-effort; expiry backstops.)
+                try:
+                    self.store.release_session_lease(session_id, self.owner_token)
+                except Exception:  # pragma: no cover - release is best-effort
+                    log.warning("session_lease_release_failed", session_id=session_id)
 
     def handle_confirmation(self, session_id: str, confirmed: bool) -> str:
-        """Confirm or deny the session's pending high-risk action."""
-        return self.orchestrator.handle_confirmation(session_id, confirmed)
+        """
+        Confirm or deny the session's pending high-risk action.
+
+        Takes the same session lease as chat(): resolution resumes the paused
+        turn (plan steps + synthesis), which must not interleave with a
+        concurrent chat on the same session. Duplicate resolutions are still
+        safe even without the lease (the confirmation pop and the action
+        claim are atomic) — the lease prevents interleaved HISTORY writes.
+        """
+        with self._exclusive_session(session_id):
+            self._acquire_session_lease_or_busy(session_id)
+            try:
+                return self.orchestrator.handle_confirmation(session_id, confirmed)
+            finally:
+                try:
+                    self.store.release_session_lease(session_id, self.owner_token)
+                except Exception:  # pragma: no cover - release is best-effort
+                    log.warning("session_lease_release_failed", session_id=session_id)
 
     def get_pending_confirmation(self, session_id: str) -> dict | None:
         return self.orchestrator.get_pending_confirmation(session_id)

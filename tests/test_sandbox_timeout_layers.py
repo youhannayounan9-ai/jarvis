@@ -110,10 +110,11 @@ class TestHostTimeoutLayer:
         assert result.timed_out is True
         assert result.timeout_layer == "host_kill"
         assert result.denial_reason == "timeout"
-        force_rm.assert_called_once()
+        # v0.17: layer C must target THIS run's container by name.
+        force_rm.assert_called_once_with(result.container_name)
 
     def test_force_remove_uses_docker_rm_f(self):
-        """Layer C termination mechanism: `docker rm -f <fixed-name>`."""
+        """Layer C termination mechanism: `docker rm -f <per-run name>`."""
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -124,10 +125,10 @@ class TestHostTimeoutLayer:
             patch("jarvis.core.sandbox.shutil.which", return_value="docker"),
             patch("jarvis.core.sandbox.subprocess.run", side_effect=fake_run),
         ):
-            DockerCodeSandbox()._force_remove_container()
+            DockerCodeSandbox()._force_remove_container("jarvis-sbx-deadbeef1234")
 
         assert calls and calls[0][:3] == ["docker", "rm", "-f"]
-        assert calls[0][3] == DockerCodeSandbox.CONTAINER_NAME
+        assert calls[0][3] == "jarvis-sbx-deadbeef1234"
 
     def test_force_remove_failure_does_not_raise(self):
         """Layer C is best-effort; its failure must not mask the denial."""
@@ -138,7 +139,7 @@ class TestHostTimeoutLayer:
                 side_effect=subprocess.TimeoutExpired(cmd="docker", timeout=5),
             ),
         ):
-            DockerCodeSandbox()._force_remove_container()  # must not raise
+            DockerCodeSandbox()._force_remove_container("jarvis-sbx-whatever")  # must not raise
 
     def test_host_deadline_exceeds_container_deadline(self):
         """Layer B should normally report first: host wait = cap + slack."""

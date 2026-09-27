@@ -243,17 +243,21 @@ class TestObservedTimeout:
         assert 4.0 <= elapsed < 10.0
 
     def test_no_orphan_container_after_timeout(self, built_image):
-        _sbx_run("while True: pass", timeout_seconds=3.0)
+        result = _sbx_run("while True: pass", timeout_seconds=3.0)
+        # v0.17: the run reports which container served it — check exactly that
+        # one (the old fixed-name check cannot work with per-run identities).
         check = subprocess.run(
-            ["docker", "ps", "--filter", f"name={DockerCodeSandbox.CONTAINER_NAME}", "--format", "{{.Names}}"],
+            ["docker", "ps", "--filter", f"name={result.container_name}", "--format", "{{.Names}}"],
             capture_output=True,
             timeout=15,
         )
-        assert DockerCodeSandbox.CONTAINER_NAME not in check.stdout.decode()
+        assert result.container_name not in check.stdout.decode()
 
     def test_force_remove_container_works_against_real_daemon(self, built_image):
         """Layer C mechanism verified for real: rm -f kills a live container."""
-        name = DockerCodeSandbox.CONTAINER_NAME
+        # v0.17: names are per-run and server-generated; this test mints its
+        # own unique name in the same namespace for the same purpose.
+        name = f"{DockerCodeSandbox.CONTAINER_NAME_PREFIX}-forcetest-{uuid.uuid4().hex[:8]}"
         # Start a long-lived container under the fixed name (as layer A would
         # find after a host-side timeout).
         start = subprocess.run(
@@ -273,7 +277,7 @@ class TestObservedTimeout:
             )
             assert name in running.stdout.decode()
             # The layer-C helper must actually terminate it.
-            DockerCodeSandbox(image=IMAGE_TAG)._force_remove_container()
+            DockerCodeSandbox(image=IMAGE_TAG)._force_remove_container(name)
             after = subprocess.run(
                 ["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
                 capture_output=True, timeout=15,
@@ -380,13 +384,13 @@ class TestSandboxEndToEnd:
         assert result.stdout.strip() == "False"
 
     def test_container_removed_after_run(self, built_image):
-        _sbx_run("print(1)")
+        result = _sbx_run("print(1)")
         check = subprocess.run(
-            ["docker", "ps", "-a", "--filter", f"name={DockerCodeSandbox.CONTAINER_NAME}", "--format", "{{.Names}}"],
+            ["docker", "ps", "-a", "--filter", f"name={result.container_name}", "--format", "{{.Names}}"],
             capture_output=True,
             timeout=15,
         )
-        assert DockerCodeSandbox.CONTAINER_NAME not in check.stdout.decode()
+        assert result.container_name not in check.stdout.decode()
 
     def test_rejection_of_unknown_language_never_touches_docker(self, built_image):
         sandbox = DockerCodeSandbox(image=IMAGE_TAG)
@@ -417,3 +421,62 @@ class TestAvailabilityGate:
             pytest.skip("only meaningful on a Windows host")
         sandbox = DockerCodeSandbox(image=IMAGE_TAG)
         assert sandbox.is_available() is False
+
+
+# ── v0.17: concurrent executions get isolated per-run identities ─────────────
+
+
+class TestConcurrentExecutions:
+    """v0.17 Track C: per-run container names under REAL concurrency.
+
+    The v0.16 sandbox used one FIXED container name, so two concurrent
+    executions either collided (docker error) or serialized. Per-run names
+    must make concurrent executions independent: unique identity, separate
+    lifecycle, execution-specific cleanup — observed against a real daemon.
+    """
+
+    def test_container_names_unique_across_runs(self, built_image):
+        seen = {_sbx_run("print(1)").container_name for _ in range(5)}
+        assert len(seen) == 5, "every execution must get a unique container name"
+        assert all(n.startswith(DockerCodeSandbox.CONTAINER_NAME_PREFIX) for n in seen)
+
+    def test_concurrent_executions_all_succeed_with_unique_names(self, built_image):
+        """The decisive v0.17 behavior: parallel runs do not collide."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(i: int):
+            r = _sbx_run(f"print('worker-{i}')", timeout_seconds=15)
+            return r
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(one, range(4)))
+
+        names = [r.container_name for r in results]
+        assert len(set(names)) == 4, "concurrent runs must not share a name"
+        for r in results:
+            assert r.ok, f"run {r.container_name} failed: {r.stderr[-300:]}"
+        assert {r.stdout.strip() for r in results} == {
+            f"worker-{i}" for i in range(4)
+        }
+
+    def test_timeout_cleanup_is_execution_specific(self, built_image):
+        """A timeout rm -f must remove ONLY its own container."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(_sbx_run, "print('slow-ok')", 15)  # long-lived
+            timeouted = pool.submit(_sbx_run, "while True: pass", 3)
+            ok_result = slow.result(timeout=60)
+            dead_result = timeouted.result(timeout=60)
+
+        assert ok_result.ok and ok_result.stdout.strip() == "slow-ok"
+        assert dead_result.timed_out and dead_result.timeout_layer == "container"
+        # Distinct identities throughout — no cross-talk was possible.
+        assert dead_result.container_name != ok_result.container_name
+        # Neither container survives its own completion.
+        for name in (ok_result.container_name, dead_result.container_name):
+            ps = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}"],
+                capture_output=True, timeout=15,
+            )
+            assert name not in ps.stdout.decode()

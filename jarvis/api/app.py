@@ -70,7 +70,7 @@ log = get_logger(__name__)
 app = FastAPI(
     title="JARVIS API",
     description="Local-first AI assistant — agent runtime over HTTP.",
-    version="0.16.0",
+    version="0.17.0",
 )
 
 # ── Runtime dependency (overridable in tests) ─────────────────────────────────
@@ -86,9 +86,16 @@ def get_runtime() -> JarvisRuntime:
 
 
 def set_runtime(runtime: JarvisRuntime | None) -> None:
-    """Swap the process runtime (tests / embedding the API in another app)."""
+    """Swap the process runtime (tests / embedding the API in another app).
+
+    Clearing the runtime (``None``) also restores the default in-memory
+    rate limiter, so a store-backed limiter never outlives the runtime whose
+    database it writes to (v0.17 hygiene).
+    """
     global _runtime
     _runtime = runtime
+    if runtime is None:
+        _ratelimit.set_limiter(None)
 
 
 # Every mutating/reading endpoint requires the key when configured.

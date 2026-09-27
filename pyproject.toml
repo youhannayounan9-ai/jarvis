@@ -1,6 +1,6 @@
 [project]
 name = "jarvis"
-version = "0.16.0"
+version = "0.17.0"
 description = "A local, modular AI assistant powered by Ollama — JARVIS v0.16 (production readiness: verified sandbox boundary, live model validation, sharper evaluation signal)"
 readme = "README.md"
 requires-python = ">=3.11"

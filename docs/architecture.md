@@ -1,6 +1,6 @@
-# JARVIS v0.16 — Architecture
+# JARVIS v0.17 — Architecture
 
-JARVIS is a local-first AI assistant organized as **one agent runtime and several thin interfaces**. This document describes the system as it actually exists in v0.16: the layered structure, the request lifecycle, the context-management and safety models, the code-execution sandbox, the service surface, and the deployment path.
+JARVIS is a local-first AI assistant organized as **one agent runtime and several thin interfaces**. This document describes the system as it actually exists in v0.17: the layered structure, the request lifecycle, the context-management and safety models, the code-execution sandbox, the service surface, and the deployment path. v0.17's theme is **action reliability and concurrency without distributed infrastructure**: a durable execution ledger makes confirmed actions at-most-once (with an explicit UNKNOWN state for crash ambiguity), session exclusivity and rate limiting moved to SQLite-backed coordination (no Redis), and sandbox executions gained per-run container identities.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -73,6 +73,10 @@ When a tool's risk tier requires confirmation (see §4), dispatch does **not** e
 Handled states: approval, denial, approved-but-failed execution (the error flows into synthesis like any tool error), expired confirmation (cannot execute), rows without context (pre-v0.15 — raw-result reply), corrupt context (graceful fallback), and a SECOND high-risk action during resume (re-parks with refreshed durable state). The turn never blocks waiting for approval mid-loop; control returns immediately.
 
 Durable schema: `pending_confirmations.context_json` (added via `ALTER TABLE` migration for pre-0.15 databases).
+
+#### Execution ledger (v0.17) — at-most-once automatic dispatch
+
+Since v0.17 every protected execution is paired 1:1 (same transaction) with a row in `action_executions`: a server-generated `action_id` (uuid4), the confirmation id, tool name/args/risk, and an explicit state — `PENDING → RUNNING → SUCCEEDED | FAILED`, plus `UNKNOWN` for the crash window between dispatch and a durably-recorded result. The claim is a single conditional `UPDATE ... WHERE state='PENDING'` judged by rowcount, so two concurrent approval requests (threads, processes, retries) produce exactly one `registry.dispatch` — the database arbitrates, not a Python lock. Repeat approvals return the recorded outcome instead of re-executing; denial marks the ledger FAILED without any dispatch attempt; a startup sweep turns stranded RUNNING rows into UNKNOWN; and UNKNOWN actions are never automatically re-executed — `handle_confirmation` returns an explicit `ACTION_EXECUTION_STATE_UNKNOWN` report instead. What this does NOT claim: the external side effect is exactly-once (it is not transactionally coupled to SQLite); the ledger guarantees at-most-once *automatic dispatch* and makes ambiguity visible. Full state machine: developer manual §8.
 
 ### Lifecycle events (observability seam)
 
@@ -154,7 +158,7 @@ Fail-closed ladder inside `execute()`: docker CLI missing → `docker_unavailabl
 **Timeout enforcement (since v0.15, three distinct layers):**
 - **B — container timeout (primary):** the entrypoint is `timeout <cap>s python3 script.py` (coreutils). The WORKLOAD is killed inside the container — exit code 124, definitive termination. This closes the classic gap where a host-side wait leaves the container burning CPU.
 - **A — host process timeout (secondary):** the host abandons the docker CLI wait at cap + 5 s slack (guards against CLI/daemon hangs).
-- **C — actual termination on layer A:** the container is force-removed (`docker rm -f jarvis-sbx-exec`), so even a layer-A timeout cannot leave an orphan workload.
+- **C — actual termination on layer A:** the container is force-removed (`docker rm -f <container>` — the per-run name, so only the offending execution is affected), so even a layer-A timeout cannot leave an orphan workload.
 
 `ExecutionResult.timeout_layer` distinguishes `container` (workload killed at the boundary) from `host_kill` (host gave up and cleaned up); `denial_reason` is `timeout` in both cases.
 
@@ -207,8 +211,8 @@ FastAPI app (`jarvis.api.app:app`), thin over the runtime:
 
 Design decisions:
 - **Authentication (opt-in):** set `JARVIS_API_KEY` to require `Authorization: Bearer <key>` (or `X-API-Key`) on every endpoint except `/health` and OpenAPI metadata. Unset = local-only trust (the default). Comparison is constant-time (`hmac.compare_digest`); failures log the client and return 401 with `WWW-Authenticate: Bearer`.
-- **Rate limiting (in-process):** sliding window per client — keyed by API key when auth is on, else client IP. `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` (default 60/60s; `0` disables). Over-limit → `429` with `Retry-After`. `/health` is exempt. Per-process only: multi-replica deployments should enforce limits at the reverse proxy.
-- **Per-session serialization:** `JarvisRuntime.chat` holds a non-blocking per-session mutex. A second concurrent turn on the same session raises immediately, mapped to **409 Conflict** by the API — history can no longer interleave and confirmations cannot double-resolve. Different sessions are fully parallel. (Runtime-local only; multi-process deployments need an external lock.)
+- **Rate limiting (two backends, v0.17):** sliding window per client — keyed by API key when auth is on, else client IP. `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` (default 60/60s; `0` disables). Over-limit → `429` with `Retry-After`. `/health` is exempt. The deployment default stays in-memory (per-process); `make_durable_limiter(store)` switches to an SQLite-backed limiter where every check is one `BEGIN IMMEDIATE` transaction — multiple JARVIS processes on the same database then enforce ONE limit per client (each decision also purges expired events, bounding table growth). `set_runtime(None)` resets to the in-memory limiter so a store-backed limiter never outlives its database.
+- **Per-session serialization (two layers, v0.17):** `JarvisRuntime.chat`/`handle_confirmation` hold a non-blocking per-session mutex (fast, in-process) around a **database-backed session lease** (`session_leases`: TTL 300 s, owner-checked renew/release, monotonically increasing fencing token bumped on stale takeover). A second concurrent turn on the same session — from another thread OR another process sharing the SQLite file — raises immediately, mapped to **409 Conflict**. A crashed owner's lease expires after the TTL, so a session can never be locked forever; documented residual race: one turn that outlives the TTL near its boundary. Different sessions are fully parallel.
 - **Dependency injection via `set_runtime()`/`get_runtime()`** — tests inject a runtime built with an in-memory store and a mocked LLM; production calls `build_runtime()` at startup.
 - **Error mapping** — unknown session → 404; busy session → 409; runtime/LLM failure → 503 with a readable message; the SSE endpoint carries errors in-band as a terminal `error` event (HTTP 200).
 - **Schemas** (`api/schemas.py`) are explicit Pydantic models — the API contract is typed, not inferred.

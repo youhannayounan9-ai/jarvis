@@ -58,7 +58,7 @@ Status legend: **ACTIVE** = on by default · **OPTIONAL** = works after you enab
 | FastAPI REST service | ACTIVE | Sessions, chat, SSE streaming, confirmations, history, health | Python deps | `uv run uvicorn jarvis.api.app:app --port 8000` |
 | SSE streaming | ACTIVE | Live agent lifecycle events | API running | `POST /chat/stream` |
 | API authentication | OPTIONAL | Bearer/X-API-Key on all endpoints except /health | `JARVIS_API_KEY` set | — |
-| Rate limiting | ACTIVE | 60 req/60s sliding window per client (disable with `0`) | None | — |
+| Rate limiting | ACTIVE | 60 req/60s sliding window per client (disable with `0`); multi-process deployments can share one limit via the database-backed limiter | None | — |
 | Streamlit dashboard | ACTIVE | Web chat UI + image upload + approval buttons | API running (or legacy in-process mode) | `streamlit run ui/dashboard.py` |
 | CLI | ACTIVE | Terminal REPL with `/confirm`, `/deny`, `/voice`, … | Python deps | `jarvis` (or `python -m jarvis.main`) |
 | Evaluation system | ACTIVE | 32-case lexical eval suite + reports + regression diff | Ollama for live runs | `uv run python evaluation/run_evals.py --list` |
@@ -275,7 +275,9 @@ curl -X POST http://localhost:8000/sessions/$SID/confirm \
   -H "Content-Type: application/json" -d '{"confirmed": true}'
 ```
 
-**Authentication behavior:** empty `JARVIS_API_KEY` = local trust. Set → `Authorization: Bearer <key>` (or `X-API-Key`) required on everything except `/health` + docs. Constant-time compare. Wrong/missing key → 401; whitespace-only key config → 503 (fail-closed). Rate limit: 60 req/60s per client → 429 + `Retry-After` (`0` disables). Same-session concurrent turns → 409.
+**Authentication behavior:** empty `JARVIS_API_KEY` = local trust. Set → `Authorization: Bearer <key>` (or `X-API-Key`) required on everything except `/health` + docs. Constant-time compare. Wrong/missing key → 401; whitespace-only key config → 503 (fail-closed). Rate limit: 60 req/60s per client → 429 + `Retry-After` (`0` disables). Same-session concurrent turns → 409 (v0.17: enforced across processes via a database-backed session lease, so a second JARVIS process cannot interleave with your session either; a crashed process's lease self-expires).
+
+**Confirmed actions execute at most once (v0.17):** every approved high-risk action gets a durable execution record. Approving twice, retrying the request, or approving after a crash returns the already-recorded outcome instead of running the tool again. If a crash leaves the outcome genuinely unknown (executed, but the result was never recorded), JARVIS **refuses to re-run it automatically** and reports `ACTION_EXECUTION_STATE_UNKNOWN` — re-issue the request deliberately if you want it redone. Denials never execute the tool at all.
 
 **Errors carry correlation IDs:** every response has `X-Request-ID` (and `/chat` echoes it as `request_id`); the server log line under that ID holds the real error — clients never see internals.
 

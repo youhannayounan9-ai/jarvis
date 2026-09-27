@@ -108,7 +108,7 @@ at the host:
   docker CLI at cap + 5 s slack. By itself this only stops *waiting* — which
   is exactly why layer B exists.
 - **C — actual termination:** if layer A fires first (hung CLI/daemon), the
-  container is force-removed (`docker rm -f jarvis-sbx-exec`) so no orphan
+  container is force-removed (`docker rm -f <container>`) so no orphan
   keeps consuming CPU.
 
 `ExecutionResult.timeout_layer` reports which layer fired (`container`,
@@ -146,22 +146,43 @@ uv run streamlit run ui/dashboard.py
 
 ---
 
-## 3. API protection (in-process)
+## 3. API protection (v0.17: process-local default, database-backed option)
 
 - **Rate limiting** — sliding-window limiter keyed by API key (or client IP
   when auth is off). `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` in
   `.env` (default 60 req / 60 s; `0` disables). Over-limit → `429` with
-  `Retry-After`. `/health` is exempt. In-process only — for multi-replica
-  deployments keep the reverse proxy as the authoritative limiter.
-- **Per-session serialization** — one chat turn per session at a time.
-  Concurrent turns on the same session return `409 Conflict` instead of
-  interleaving history or double-resolving confirmations. Different sessions
-  are fully parallel. **Single-replica only:** the lock is process-local, so
-  run exactly one API container per session domain (the compose file does).
-- **Confirmation continuation (v0.15)** — an approved/denied high-risk action
-  RESUMES the original task: remaining plan steps execute and the final
-  answer is synthesized, even if the service restarted while the action was
-  pending. The pause state lives in SQLite next to the confirmation row.
+  `Retry-After`. `/health` is exempt. Two backends behind one class
+  (`jarvis/api/ratelimit.py`):
+
+  - **In-memory (deployment default):** per-process. For multi-replica
+    deployments keep the reverse proxy as the authoritative limiter.
+  - **SQLite-backed (opt-in):** `make_durable_limiter(store)` from
+    `jarvis.api.ratelimit` records hits in the shared JARVIS database
+    (`rate_limit_events`). Every check is one `BEGIN IMMEDIATE` write
+    transaction, so all processes pointing at the same `DB_PATH` enforce
+    ONE limit per client; each check also deletes expired events (the table
+    stays at ~clients × max_requests rows). Costs a DB write per request —
+    enable it when you run more than one JARVIS process against one volume.
+
+  No Redis or external service is involved in either backend.
+- **Per-session serialization — two layers (v0.17)** — one chat turn per
+  session at a time; concurrent turns on the same session return `409
+  Conflict` instead of interleaving history or double-resolving
+  confirmations. Different sessions are fully parallel. Layer 1 is the
+  process-local mutex (fast). Layer 2 is a **database-backed session
+  lease** (`session_leases` table): TTL 300 s, owner-checked renew/release,
+  fencing token bumped on takeover — two JARVIS processes sharing one
+  `DB_PATH` can no longer both process the same session, and a crashed
+  process's lease self-expires (no indefinite lock). Residual race: a single
+  turn that outlives the 300 s TTL near its boundary.
+- **Confirmation continuation (v0.15) + execution ledger (v0.17)** — an
+  approved/denied high-risk action RESUMES the original task, even if the
+  service restarted while the action was pending. Every protected execution
+  is additionally recorded in the `action_executions` ledger (PENDING →
+  RUNNING → SUCCEEDED/FAILED, with UNKNOWN for crash ambiguity): repeated
+  approvals return the recorded outcome instead of re-executing, and actions
+  whose outcome is unknown are never automatically re-run
+  (`ACTION_EXECUTION_STATE_UNKNOWN` report; see docs/JARVIS_DEVELOPER_MANUAL.md §8).
 - **Auth** — see README (`JARVIS_API_KEY`, Bearer/X-API-Key, constant-time).
 
 ---
