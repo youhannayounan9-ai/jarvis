@@ -22,6 +22,10 @@ from jarvis.utils.logging import get_logger
 log = get_logger(__name__)
 
 _COLLECTION_NAME = "long_term_memory"
+# v0.20: documents live in a DEDICATED collection so document knowledge and
+# personal facts never mix into one retrieval space. Same embedding model
+# (all-MiniLM-L6-v2, on-device) and cosine space as personal memory.
+KNOWLEDGE_COLLECTION_NAME = "knowledge_base"
 _EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 _vector_store: VectorStore | None = None
@@ -45,6 +49,12 @@ class VectorStore:
         self._client = chromadb.PersistentClient(path=str(db_path))
         self._collection = self._client.get_or_create_collection(
             name=_COLLECTION_NAME,
+            embedding_function=embedding_fn,
+            metadata={"hnsw:space": "cosine"},
+        )
+        # v0.20: knowledge collection shares the client + embedding fn.
+        self._knowledge_collection = self._client.get_or_create_collection(
+            name=KNOWLEDGE_COLLECTION_NAME,
             embedding_function=embedding_fn,
             metadata={"hnsw:space": "cosine"},
         )
@@ -165,6 +175,98 @@ class VectorStore:
             limit=limit,
         )
         return "\n".join(lines).rstrip()
+
+
+    # ── v0.20: knowledge base (separate collection; see KNOWLEDGE_COLLECTION_NAME) ──
+
+    def add_knowledge_chunks(
+        self,
+        chunks: list[str],
+        ids: list[str],
+        metadatas: list[dict],
+    ) -> int:
+        """Embed + persist document chunks in the knowledge collection."""
+        if not chunks:
+            return 0
+        self._knowledge_collection.add(
+            ids=ids, documents=chunks, metadatas=metadatas
+        )
+        log.info("knowledge_chunks_added", count=len(chunks))
+        return len(chunks)
+
+    def delete_knowledge_chunks(self, where: dict) -> int:
+        """Delete knowledge chunks matching a metadata filter; returns count."""
+        got = self._knowledge_collection.get(where=where, include=[])
+        ids = got.get("ids") or []
+        if ids:
+            self._knowledge_collection.delete(ids=ids)
+            log.info("knowledge_chunks_deleted", count=len(ids), where=where)
+        return len(ids)
+
+    def knowledge_chunk_ids(self, where: dict) -> list[str]:
+        """Chunk ids matching a metadata filter (bounded by Chroma get)."""
+        got = self._knowledge_collection.get(where=where, include=[])
+        return list(got.get("ids") or [])
+
+    def knowledge_count(self, where: dict | None = None) -> int:
+        """Number of knowledge chunks (optionally per document filter)."""
+        if where is None:
+            return int(self._knowledge_collection.count())
+        return len(self.knowledge_chunk_ids(where))
+
+    def search_knowledge(
+        self,
+        query: str,
+        top_k: int = 5,
+        where: dict | None = None,
+        max_distance: float | None = None,
+    ) -> list[dict]:
+        """Bounded semantic search over the knowledge collection.
+
+        Returns a list of {text, metadata, distance, id} dicts, most
+        relevant first (Chroma returns distance-ascending for cosine).
+        Deterministic for identical queries + identical collections.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        top_k = max(1, min(int(top_k), 20))
+        count = self._knowledge_collection.count()
+        if count == 0:
+            return []
+        raw = self._knowledge_collection.query(
+            query_texts=[query],
+            n_results=min(top_k, count),
+            where=where,
+            include=["documents", "metadatas", "distances"],
+        )
+        documents = (raw.get("documents") or [[]])[0]
+        metadatas = (raw.get("metadatas") or [[]])[0]
+        distances = (raw.get("distances") or [[]])[0]
+        ids = (raw.get("ids") or [[]])[0]
+        results: list[dict] = []
+        for i, doc in enumerate(documents):
+            dist = distances[i] if i < len(distances) else None
+            if (
+                max_distance is not None
+                and isinstance(dist, (int, float))
+                and dist > max_distance
+            ):
+                continue
+            results.append({
+                "id": ids[i] if i < len(ids) else "",
+                "text": doc,
+                "metadata": metadatas[i] if i < len(metadatas) else {},
+                "distance": dist,
+            })
+        log.info(
+            "knowledge_search",
+            query_chars=len(query),
+            hits=len(results),
+            top_k=top_k,
+            filtered=where is not None,
+        )
+        return results
 
 
 def get_vector_store() -> VectorStore:

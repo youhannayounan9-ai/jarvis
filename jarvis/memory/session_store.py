@@ -84,6 +84,10 @@ class ActionExecution:
     claimed_at: str | None
     finished_at: str | None
     owner: str | None
+    # v0.19: durable resume context captured when the action was parked
+    # (JSON, may be None on legacy rows). Enables full-context recovery on
+    # an explicit UNKNOWN reissue. Never exposed via the API surface.
+    pause_context_json: str | None = None
 
 
 # ── Session lease (v0.17): database-backed per-session turn coordination ─────
@@ -102,6 +106,32 @@ def new_owner_token(component: str = "runtime") -> str:
         f"{socket.gethostname()}:{__import__('os').getpid()}:{component}:"
         f"{uuid.uuid4().hex[:8]}"
     )
+
+
+def redact_owner(owner_token: str | None) -> str:
+    """
+    Operator-safe rendering of a lease/action owner token.
+
+    The raw token (``host:pid:component:random``) is an internal identity;
+    only its component and short random suffix are disclosable. None/empty
+    renders as ``none`` (e.g. an action that was never claimed).
+    """
+    if not owner_token:
+        return "none"
+    parts = str(owner_token).split(":")
+    if len(parts) >= 4:
+        return f"{parts[2]}:{parts[3]}"
+    if len(parts) >= 1 and parts[0]:
+        return parts[-1][:16]
+    return "none"
+
+
+# Deliberate reissue of an UNKNOWN action creates a NEW action identity;
+# this bounds how many times one original action may be reissued (no loops).
+MAX_REISSUES_PER_ACTION: int = 3
+
+# Hard upper bound for ledger introspection queries (memory safety).
+_MAX_ACTION_LIST_LIMIT: int = 500
 
 
 class SessionStore:
@@ -265,6 +295,144 @@ class SessionStore:
         )
         return messages
 
+    def cleanup_operational_records(
+        self,
+        terminal_actions_days: int = 30,
+        reissues_days: int = 90,
+        leases_days: int = 30,
+        dry_run: bool = False,
+    ) -> dict[str, int]:
+        """
+        v0.19 retention for operational records — bounded, conservative,
+        transactional. Only TERMINAL ledger states age out (SUCCEEDED, plus
+        FAILED rows whose confirmation is no longer active); PENDING, RUNNING
+        and UNKNOWN are NEVER deleted here, active confirmations are never
+        orphaned, and every still-referenced audit row is kept (a reissue
+        whose original or new action still exists survives regardless of
+        age, so chains never dangle). Also purges leases of sessions that no
+        longer exist. Returns per-table candidate counts; with ``dry_run``
+        nothing is mutated (count-only pass, explicit contract, tested).
+        """
+        cutoff_a = (
+            datetime.now(tz=timezone.utc) - timedelta(days=terminal_actions_days)
+        ).isoformat()
+        cutoff_r = (
+            datetime.now(tz=timezone.utc) - timedelta(days=reissues_days)
+        ).isoformat()
+        cutoff_l = (
+            datetime.now(tz=timezone.utc) - timedelta(days=leases_days)
+        ).isoformat()
+        with self._lock:
+            # ── 1. Terminal action candidates (age + state gates) ───────────
+            # Protected audit rows: any action referenced by a reissue must
+            # survive, or the audit chain would dangle (FK violation).
+            reissue_referenced = {
+                str(r[0])
+                for r in self._conn.execute(
+                    "SELECT original_action_id FROM action_reissues "
+                    "UNION SELECT new_action_id FROM action_reissues"
+                ).fetchall()
+            }
+            # Confirmations not yet completed: their ledger rows are the
+            # at-most-once identity for an approval that may still arrive.
+            live_confirmations = {
+                str(r[0])
+                for r in self._conn.execute(
+                    """
+                    SELECT confirmation_id FROM pending_confirmations
+                     WHERE completed_at IS NULL
+                    """
+                ).fetchall()
+            }
+            candidates: set[str] = set()
+            confirmation_by_action: dict[str, str] = {}
+            for r in self._conn.execute(
+                """
+                SELECT action_id, confirmation_id, state FROM action_executions
+                 WHERE created_at < ? AND state IN (?, ?)
+                """,
+                (cutoff_a, ACTION_STATE_SUCCEEDED, ACTION_STATE_FAILED),
+            ).fetchall():
+                confirmation_by_action[str(r["action_id"])] = str(r["confirmation_id"])
+                candidates.add(str(r["action_id"]))
+            candidates -= reissue_referenced
+            # A FAILED action whose confirmation is still awaiting resolution
+            # is recoverable state — keep it.
+            candidates -= {
+                a for a, cid in confirmation_by_action.items()
+                if cid in live_confirmations
+            }
+
+            # ── 2. Reissue audit rows (only when BOTH ends are gone) ────────
+            # Compute the post-cleanup action set so a reissue whose ends are
+            # removed in THIS pass is also collected; anything whose original
+            # or new action still exists is kept, however old (chain integrity).
+            final_action_rows = {
+                str(r["action_id"])
+                for r in self._conn.execute(
+                    "SELECT action_id FROM action_executions"
+                ).fetchall()
+            } - candidates
+            reissue_candidates: list[int] = []
+            for r in self._conn.execute(
+                "SELECT id, original_action_id, new_action_id, created_at FROM action_reissues"
+            ).fetchall():
+                if str(r["created_at"]) >= cutoff_r:
+                    continue
+                if (
+                    str(r["original_action_id"]) not in final_action_rows
+                    and str(r["new_action_id"]) not in final_action_rows
+                ):
+                    reissue_candidates.append(int(r["id"]))
+
+            # ── 3. Stale leases (expired past retention or orphaned) ────────
+            stale_lease_rows = [
+                str(r["session_id"])
+                for r in self._conn.execute(
+                    """
+                    SELECT session_id FROM session_leases
+                     WHERE expires_at < ?
+                        OR session_id NOT IN (SELECT id FROM sessions)
+                    """,
+                    (cutoff_l,),
+                ).fetchall()
+            ]
+
+            # ── 4. Mutate (one transaction) or just report ─────────────────
+            if not dry_run:
+                if candidates:
+                    marks = ",".join("?" for _ in candidates)
+                    self._conn.execute(
+                        f"DELETE FROM action_executions WHERE action_id IN ({marks})",
+                        tuple(candidates),
+                    )
+                if reissue_candidates:
+                    marks = ",".join("?" for _ in reissue_candidates)
+                    self._conn.execute(
+                        f"DELETE FROM action_reissues WHERE id IN ({marks})",
+                        tuple(reissue_candidates),
+                    )
+                if stale_lease_rows:
+                    marks = ",".join("?" for _ in stale_lease_rows)
+                    self._conn.execute(
+                        f"DELETE FROM session_leases WHERE session_id IN ({marks})",
+                        tuple(stale_lease_rows),
+                    )
+                self._conn.commit()
+        if not dry_run:
+            log.info(
+                "cleanup_operational_records",
+                actions_removed=len(candidates),
+                reissues_removed=len(reissue_candidates),
+                leases_removed=len(stale_lease_rows),
+            )
+        return {
+            "actions_removed": len(candidates),
+            "reissues_removed": len(reissue_candidates),
+            "stale_leases_removed": len(stale_lease_rows),
+            "dry_run": int(dry_run),
+        }
+
     def cleanup_old_sessions(self, max_age_days: int = 30) -> int:
         """Delete sessions older than max_age_days."""
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
@@ -369,15 +537,20 @@ class SessionStore:
             # v0.17: every parked action immediately gets a durable ledger row
             # (PENDING) in the SAME transaction — the identity that the
             # approval path later claims at-most-once.
+            # v0.19: the resume context is ALSO captured here (same
+            # transaction), so it survives the confirmation pop and any crash
+            # window; an explicit UNKNOWN reissue can then restore the
+            # original paused task verbatim.
             self._conn.execute(
                 """
                 INSERT INTO action_executions
                     (action_id, session_id, confirmation_id, tool_name, tool_args,
-                     risk_level, state, attempt, result, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+                     risk_level, state, attempt, result, created_at, pause_context_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
                 """,
                 (uuid.uuid4().hex, session_id, confirmation_id, tool_name,
-                 tool_args, risk_level, ACTION_STATE_PENDING, _utcnow()),
+                 tool_args, risk_level, ACTION_STATE_PENDING, _utcnow(),
+                 context_json),
             )
             self._conn.commit()
         log.info(
@@ -550,6 +723,645 @@ class SessionStore:
             ).fetchone()
         return self._action_row_to_dataclass(row) if row else None
 
+    # ── Action ledger introspection (v0.18, read-only) ───────────────────────
+
+    def list_action_executions(
+        self,
+        state: str | None = None,
+        session_id: str | None = None,
+        limit: int = 50,
+        newer_than: str | None = None,
+    ) -> list[ActionExecution]:
+        """
+        Bounded, deterministic read-only view of the ledger, newest first.
+
+        Filters: exact ``state`` (must be a valid ledger state when given),
+        exact ``session_id``, and ``newer_than`` (ISO timestamp, exclusive —
+        the cursor boundary for pagination). Always ``LIMIT``-bounded so a
+        large history never floods memory; ties broken by rowid for a stable
+        order.
+        """
+        if state is not None and state not in (
+            ACTION_STATE_PENDING,
+            ACTION_STATE_RUNNING,
+            ACTION_STATE_SUCCEEDED,
+            ACTION_STATE_FAILED,
+            ACTION_STATE_UNKNOWN,
+        ):
+            raise ValueError(f"invalid action state filter: {state!r}")
+        limit = max(1, min(int(limit), _MAX_ACTION_LIST_LIMIT))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if newer_than is not None:
+            clauses.append("created_at > ?")
+            params.append(newer_than)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM action_executions {where}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [self._action_row_to_dataclass(r) for r in rows]
+
+    def count_action_executions_by_state(self) -> dict[str, int]:
+        """One bounded aggregate row per ledger state (zero rows for empty states)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT state, COUNT(*) AS n FROM action_executions GROUP BY state"
+            ).fetchall()
+        return {str(r["state"]): int(r["n"]) for r in rows}
+
+    # ── UNKNOWN recovery: explicit reissue (v0.18) ────────────────────────
+    #
+    # Reissue NEVER flips an UNKNOWN action back to RUNNING under the same
+    # identity. It creates a NEW PENDING action (fresh action_id) that flows
+    # through the normal permission/confirmation/dispatch machinery, and
+    # records an audit row linking original → reissued.
+
+    def count_reissues_for_action(self, action_id: str) -> int:
+        """How many reissues already descend from this action (bounded loops)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM action_reissues WHERE original_action_id = ?",
+                (action_id,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def request_action_reissue(
+        self,
+        action_id: str,
+        request_id: str,
+        max_reissues: int = MAX_REISSUES_PER_ACTION,
+    ) -> str:
+        """
+        Deliberately re-issue an UNKNOWN action as a NEW action identity.
+
+        One transaction does everything, so concurrent duplicate reissue
+        requests (same request_id, two processes) still produce exactly one
+        new action:
+
+          1. Load the original; refuse unless it is UNKNOWN.
+          2. Return early when this exact request already reissued the
+             action (idempotent: same request → same new action) — even
+             after the reissue ceiling was reached.
+          3. Enforce the reissue ceiling (MAX_REISSUES_PER_ACTION).
+          4. Refuse when the session already holds an ACTIVE pending
+             confirmation: one active confirmation per session, and reissue
+             never silently replaces what the user is currently being asked
+             to approve. Completed/expired leftovers are cleaned up and
+             their stranded PENDING ledger rows closed, exactly like
+             save_pending_confirmation's replace semantics.
+          5. INSERT the new PENDING ledger row AND its durable pending
+             confirmation (confirmation_id ``reissue:{request_id}:{action}``)
+             so the reissued action resolves through the ordinary
+             handle_confirmation flow — approval, denial, and the claim
+             machinery are unchanged. Empty resume context: the outcome is
+             reported directly, like any freshly parked action.
+          6. INSERT the audit row last — the (request_id, action_id) UNIQUE
+             index is the cross-process idempotency gate; on that conflict
+             the reissue this same request already created is returned.
+
+        Nothing executes here: the new action is PENDING with attempt 0 and
+        runs only after an explicit approval, exactly like any other
+        protected action. The original UNKNOWN row is never modified.
+
+        Raises:
+            ValueError: unknown action, wrong state, reissue limit reached,
+                or the session already has an active pending confirmation.
+        """
+        if not request_id or not request_id.strip():
+            raise ValueError("reissue request_id must be non-empty")
+        session_id = ""
+        with self._lock:
+            try:
+                original = self._conn.execute(
+                    "SELECT * FROM action_executions WHERE action_id = ?",
+                    (action_id,),
+                ).fetchone()
+                if original is None:
+                    raise ValueError(f"unknown action_id: {action_id}")
+                if str(original["state"]) != ACTION_STATE_UNKNOWN:
+                    raise ValueError(
+                        f"action {action_id} is {original['state']}, not UNKNOWN — "
+                        "reissue is only for ambiguous (UNKNOWN) actions"
+                    )
+                session_id = str(original["session_id"])
+                # Idempotent replay first (C4): this exact request already
+                # reissued this action → return the same new action without
+                # touching anything. Must precede the ceiling and the
+                # active-confirmation guard so accidental duplicate
+                # submissions never fail spuriously.
+                seen = self._conn.execute(
+                    """
+                    SELECT new_action_id FROM action_reissues
+                    WHERE request_id = ? AND original_action_id = ?
+                    """,
+                    (request_id, action_id),
+                ).fetchone()
+                if seen is not None:
+                    log.info("action_reissue_duplicate_request", action_id=action_id)
+                    return str(seen["new_action_id"])
+                already = self._conn.execute(
+                    """
+                    SELECT COUNT(*) AS n FROM action_reissues
+                    WHERE original_action_id = ?
+                    """,
+                    (action_id,),
+                ).fetchone()
+                if int(already["n"]) >= max_reissues:
+                    raise ValueError(
+                        f"reissue limit reached for action {action_id} "
+                        f"({int(already['n'])}/{max_reissues})"
+                    )
+                now = _utcnow()
+                # The reissued action must be resolvable through the normal
+                # confirmation flow, so park a durable pending confirmation
+                # for the session in the SAME transaction. One active
+                # confirmation per session (PK on session_id): refuse rather
+                # than silently replace what the user is currently being
+                # asked about; clean up completed/expired leftovers exactly
+                # like save_pending_confirmation's replace semantics.
+                previous = self._conn.execute(
+                    """
+                    SELECT confirmation_id, completed_at, expires_at
+                    FROM pending_confirmations WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if previous is not None:
+                    if (
+                        previous["completed_at"] is None
+                        and _parse_ts(str(previous["expires_at"]))
+                        > datetime.now(tz=timezone.utc)
+                    ):
+                        raise ValueError(
+                            f"session {session_id} already has an active "
+                            "pending confirmation — resolve it before "
+                            "reissuing actions for this session"
+                        )
+                    self._conn.execute(
+                        """
+                        UPDATE action_executions
+                           SET state = ?, result = ?, finished_at = ?
+                         WHERE confirmation_id = ? AND state = ?
+                        """,
+                        (ACTION_STATE_FAILED,
+                         "superseded: a newer action replaced this confirmation",
+                         now, previous["confirmation_id"], ACTION_STATE_PENDING),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM pending_confirmations WHERE session_id = ?",
+                        (session_id,),
+                    )
+                new_action_id = uuid.uuid4().hex
+                # Deterministic per (request_id, original action): replays
+                # rebuild the same id, and one request_id reused across two
+                # different originals can never collide on the
+                # confirmation_id → ledger-row lookup.
+                reissue_confirmation_id = f"reissue:{request_id}:{action_id}"
+                self._conn.execute(
+                    """
+                    INSERT INTO action_executions
+                        (action_id, session_id, confirmation_id, tool_name, tool_args,
+                         risk_level, state, attempt, result, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+                    """,
+                    (
+                        new_action_id,
+                        session_id,
+                        reissue_confirmation_id,
+                        original["tool_name"],
+                        original["tool_args"],
+                        original["risk_level"],
+                        ACTION_STATE_PENDING,
+                        now,
+                    ),
+                )
+                # Durable confirmation row: approval/denial flows through the
+                # ordinary handle_confirmation path (permission architecture
+                # unchanged). v0.19 full-context recovery: the ORIGINAL
+                # action's captured pause context (recorded at park time in
+                # the same transaction that created the ledger row) is copied
+                # verbatim onto the new confirmation, so approval continues
+                # the original paused task — remaining plan steps, budgets,
+                # mode — instead of stopping at a bare result. Malformed or
+                # absent context degrades to the pre-v0.19 raw-result reply
+                # (load_pending_confirmation already handles both). A fresh
+                # recovery marker lets the orchestrator label the resumed
+                # step truthfully ("recovered action") in synthesis.
+                original_ctx_raw = original["pause_context_json"]
+                # v0.19 transitive recovery: when reissuing a reissued action
+                # whose own confirmation was already resolved (and therefore
+                # popped), the task context lives on the CHAIN ORIGIN's ledger
+                # row. Walk back through the audit rows (bounded by the
+                # reissue ceiling) so the new action always carries the
+                # original task context — chain depth stays ≤ 3.
+                if not (original_ctx_raw and original_ctx_raw.strip()):
+                    cursor_origin: str | None = action_id
+                    seen_origins: set[str] = set()
+                    while cursor_origin:
+                        if cursor_origin in seen_origins:  # pragma: no cover
+                            break
+                        seen_origins.add(cursor_origin)
+                        prev = self._conn.execute(
+                            """
+                            SELECT original_action_id FROM action_reissues
+                             WHERE new_action_id = ?
+                            """,
+                            (cursor_origin,),
+                        ).fetchone()
+                        if prev is None:
+                            break
+                        cursor_origin = str(prev["original_action_id"])
+                        ancestor = self._conn.execute(
+                            """
+                            SELECT pause_context_json FROM action_executions
+                             WHERE action_id = ?
+                            """,
+                            (cursor_origin,),
+                        ).fetchone()
+                        if ancestor is not None and ancestor["pause_context_json"]:
+                            original_ctx_raw = str(ancestor["pause_context_json"])
+                            break
+                if original_ctx_raw:
+                    try:
+                        recovery_ctx: dict[str, Any] = dict(
+                            json.loads(original_ctx_raw)
+                        )
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        log.warning(
+                            "reissue_context_corrupt_degrades",
+                            action_id=action_id,
+                        )
+                        recovery_ctx = {}
+                    recovery_ctx["recovered_from_action"] = action_id
+                    recovery_ctx["recovered_request_id"] = request_id
+                else:
+                    recovery_ctx = {}
+                    recovery_ctx["recovered_from_action"] = action_id
+                    recovery_ctx["recovered_request_id"] = request_id
+                self._conn.execute(
+                    """
+                    INSERT INTO pending_confirmations
+                        (confirmation_id, session_id, tool_name, tool_args, tool_call_id,
+                         risk_level, created_at, expires_at, completed_at, context_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (
+                        reissue_confirmation_id,
+                        session_id,
+                        str(original["tool_name"]),
+                        str(original["tool_args"]),
+                        f"reissue-{request_id}-{action_id[:12]}",
+                        str(original["risk_level"]),
+                        now,
+                        (
+                            datetime.now(tz=timezone.utc)
+                            + timedelta(minutes=CONFIRMATION_TTL_MINUTES)
+                        ).isoformat(),
+                        json.dumps(recovery_ctx, separators=(",", ":")),
+                    ),
+                )
+                # Audit row last: its UNIQUE index is the cross-process
+                # idempotency gate (C4).
+                self._conn.execute(
+                    """
+                    INSERT INTO action_reissues
+                        (request_id, original_action_id, new_action_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (request_id, action_id, new_action_id, now),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError as e:
+                # Same request_id for the same original action reissued by a
+                # concurrent process — return the existing result instead of
+                # failing (C4). A pending_confirmations PK conflict under a
+                # concurrent same-session reissue surfaces as a clear 409.
+                self._conn.rollback()
+                row = self._conn.execute(
+                    """
+                    SELECT new_action_id FROM action_reissues
+                    WHERE request_id = ? AND original_action_id = ?
+                    """,
+                    (request_id, action_id),
+                ).fetchone()
+                if row is not None:
+                    log.info("action_reissue_duplicate_request", action_id=action_id)
+                    return str(row["new_action_id"])
+                if "pending_confirmations" in str(e):
+                    raise ValueError(
+                        f"session {session_id} already has an active pending "
+                        "confirmation — resolve it before reissuing actions "
+                        "for this session"
+                    ) from e
+                raise
+            except Exception:
+                self._conn.rollback()
+                raise
+        log.warning(
+            "action_reissue_created",
+            original_action_id=action_id,
+            new_action_id=new_action_id,
+            request_id=request_id,
+            confirmation_id=reissue_confirmation_id,
+        )
+        return new_action_id
+
+    def get_reissue_chain(self, action_id: str) -> list[dict[str, str]]:
+        """Audit relationship: every reissue descending from this action."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT request_id, original_action_id, new_action_id, created_at
+                FROM action_reissues
+                WHERE original_action_id = ?
+                ORDER BY created_at, id
+                """,
+                (action_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_reissue_origin(self, new_action_id: str) -> str | None:
+        """The UNKNOWN action this one was reissued from, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT original_action_id FROM action_reissues WHERE new_action_id = ?",
+                (new_action_id,),
+            ).fetchone()
+        return str(row["original_action_id"]) if row else None
+
+    def get_action_recovery_preview(self, action_id: str) -> dict[str, Any]:
+        """
+        Safe, bounded recovery preview for an action (operator decision
+        support; NEVER the raw context — tool payloads stay in the store).
+
+        Returns: has_context, original_request (truncated), mode,
+        step_number, pending_steps, completed_steps, remaining_rounds,
+        recoverable, recoverable_reason. Unknown/legacy/corrupt rows are
+        reported honestly rather than guessed.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT pause_context_json FROM action_executions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+        if row is None:
+            return {"recoverable": False, "recoverable_reason": "unknown action"}
+        raw = row["pause_context_json"]
+        if not raw:
+            return {
+                "recoverable": False,
+                "recoverable_reason": (
+                    "no durable resume context was captured for this action "
+                    "(pre-v0.19 row or a fast-path park without a plan); "
+                    "reissue still works and reports the result directly"
+                ),
+                "has_context": False,
+            }
+        try:
+            ctx = json.loads(raw)
+            if not isinstance(ctx, dict):
+                raise ValueError("context is not an object")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {
+                "recoverable": False,
+                "recoverable_reason": (
+                    "captured context is corrupt; reissue will degrade to "
+                    "reporting the result directly (pre-v0.19 behavior)"
+                ),
+                "has_context": True,
+                "corrupt": True,
+            }
+        pending = [
+            s for s in (ctx.get("pending_plan") or [])
+            if str(s.get("description") or "").strip()
+            and int(s.get("step_number") or 0) > int(ctx.get("step_number") or 0)
+        ]
+        original_request = str(ctx.get("original_request") or "")
+        return {
+            "recoverable": bool(original_request.strip()),
+            "has_context": True,
+            "recoverable_reason": (
+                "approval will execute the tool once, then continue the "
+                "original task from its paused step"
+                if original_request.strip()
+                else "context exists but carries no original_request; "
+                "reissue reports the result directly"
+            ),
+            "original_request": original_request[:300],
+            "mode": str(ctx.get("mode") or "complex"),
+            "step_number": int(ctx.get("step_number") or 0),
+            "pending_steps": len(pending),
+            "completed_steps": len(ctx.get("completed_steps") or []),
+            "remaining_rounds": int(ctx.get("remaining_rounds") or 0),
+        }
+
+    # ── v0.19: causal session timeline (read-only) ────────────────────────
+
+    def get_session_timeline(
+        self, session_id: str, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """
+        Causal, read-only timeline of one session's reliability events,
+        merged in timestamp order:
+
+          message / confirmation_parked / action_state / reissue /
+          confirmation_resolved / lease
+
+        Bounded (LIMIT clamped to _MAX_ACTION_LIST_LIMIT); stable ordering by
+        (ts, seq). NEVER includes tool_args, tool result bodies, message
+        content, or raw owner tokens — safe metadata only. Unknown sessions
+        return [] (callers decide 404 vs empty).
+        """
+        limit = max(1, min(int(limit), _MAX_ACTION_LIST_LIMIT))
+        events: list[dict[str, Any]] = []
+        with self._lock:
+            for row in self._conn.execute(
+                """
+                SELECT id, role, created_at FROM messages
+                 WHERE session_id = ? ORDER BY id LIMIT ?
+                """,
+                (session_id, limit),
+            ):
+                events.append({
+                    "ts": row["created_at"], "seq": int(row["id"]),
+                    "kind": "message", "role": row["role"],
+                })
+            for row in self._conn.execute(
+                """
+                SELECT tool_name, risk_level, created_at, completed_at
+                  FROM pending_confirmations WHERE session_id = ? LIMIT ?
+                """,
+                (session_id, limit),
+            ):
+                events.append({
+                    "ts": row["created_at"], "seq": 0,
+                    "kind": "confirmation_parked",
+                    "tool": row["tool_name"], "risk_level": row["risk_level"],
+                    "resolved": row["completed_at"] is not None,
+                })
+            for row in self._conn.execute(
+                """
+                SELECT action_id, confirmation_id, tool_name, risk_level, state,
+                       attempt, created_at, claimed_at, finished_at
+                  FROM action_executions WHERE session_id = ? LIMIT ?
+                """,
+                (session_id, limit),
+            ):
+                events.append({
+                    "ts": row["created_at"], "seq": 0,
+                    "kind": "action_state", "action_id": row["action_id"],
+                    "confirmation_id": row["confirmation_id"],
+                    "tool": row["tool_name"], "risk_level": row["risk_level"],
+                    "state": row["state"], "attempt": int(row["attempt"]),
+                    "claimed_at": row["claimed_at"],
+                    "finished_at": row["finished_at"],
+                })
+            for row in self._conn.execute(
+                """
+                SELECT r.request_id, r.original_action_id, r.new_action_id,
+                       r.created_at, a.tool_name
+                  FROM action_reissues r
+                  JOIN action_executions a ON a.action_id = r.original_action_id
+                 WHERE a.session_id = ? LIMIT ?
+                """,
+                (session_id, limit),
+            ):
+                events.append({
+                    "ts": row["created_at"], "seq": 0,
+                    "kind": "reissue", "request_id": row["request_id"],
+                    "original_action_id": row["original_action_id"],
+                    "new_action_id": row["new_action_id"],
+                    "tool": row["tool_name"],
+                })
+            for row in self._conn.execute(
+                """
+                SELECT owner_token, acquired_at, expires_at, fencing
+                  FROM session_leases WHERE session_id = ? LIMIT 1
+                """,
+                (session_id,),
+            ).fetchall():
+                events.append({
+                    "ts": row["acquired_at"], "seq": 0,
+                    "kind": "lease",
+                    "owner": redact_owner(row["owner_token"]),
+                    "fencing": int(row["fencing"]),
+                    "active": _parse_ts(row["expires_at"]) > datetime.now(tz=timezone.utc),
+                })
+        events.sort(key=lambda e: (str(e.get("ts") or ""), int(e.get("seq") or 0)))
+        return events[-limit:]
+
+    # ── v0.20: personal knowledge base — document registry (read/write) ───
+
+    def upsert_knowledge_document(
+        self,
+        document_id: str,
+        source_path: str,
+        filename: str,
+        media_type: str,
+        size_bytes: int,
+        content_hash: str,
+        chunk_count: int,
+        parser_version: str,
+        modified_at: str | None = None,
+    ) -> None:
+        """Insert or refresh one document's registry row (one tx)."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO knowledge_documents
+                    (document_id, source_path, filename, media_type, size_bytes,
+                     content_hash, chunk_count, parser_version, ingested_at, modified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    source_path    = excluded.source_path,
+                    filename       = excluded.filename,
+                    media_type     = excluded.media_type,
+                    size_bytes     = excluded.size_bytes,
+                    content_hash   = excluded.content_hash,
+                    chunk_count    = excluded.chunk_count,
+                    parser_version = excluded.parser_version,
+                    ingested_at    = excluded.ingested_at,
+                    modified_at    = excluded.modified_at
+                """,
+                (
+                    document_id, source_path, filename, media_type, int(size_bytes),
+                    content_hash, int(chunk_count), parser_version, _utcnow(),
+                    modified_at,
+                ),
+            )
+            self._conn.commit()
+        log.info(
+            "knowledge_document_upserted",
+            document_id=document_id,
+            filename=filename,
+            chunk_count=chunk_count,
+        )
+
+    def get_knowledge_document(self, document_id: str) -> dict[str, Any] | None:
+        """One document's registry row, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM knowledge_documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_knowledge_document_by_path(self, source_path: str) -> dict[str, Any] | None:
+        """Registry row for an exact absolute source path, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM knowledge_documents WHERE source_path = ?",
+                (source_path,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_knowledge_documents(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Bounded, newest-first document registry listing."""
+        limit = max(1, min(int(limit), 500))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM knowledge_documents
+                 ORDER BY ingested_at DESC, rowid DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_knowledge_document(self, document_id: str) -> bool:
+        """Remove one document's registry row. True when it existed."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM knowledge_documents WHERE document_id = ?",
+                (document_id,),
+            )
+            self._conn.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            log.info("knowledge_document_deleted", document_id=document_id)
+        return deleted
+
+    def find_knowledge_document_by_hash(self, content_hash: str) -> dict[str, Any] | None:
+        """Any document with identical content (same-bytes reuse), or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM knowledge_documents WHERE content_hash = ? LIMIT 1",
+                (content_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def claim_action_execution(self, action_id: str, owner: str) -> str:
         """
         Atomically claim the single execution attempt for an action.
@@ -709,6 +1521,10 @@ class SessionStore:
             claimed_at=row["claimed_at"],
             finished_at=row["finished_at"],
             owner=row["owner"],
+            pause_context_json=(
+                row["pause_context_json"]
+                if "pause_context_json" in row.keys() else None
+            ),
         )
 
     # ── Session leases (v0.17) ────────────────────────────────────────────────
@@ -824,6 +1640,40 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
+    # ── Lease introspection (v0.18, read-only) ────────────────────────────
+
+    def list_session_leases(
+        self,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        # Bounded, deterministic read-only view of session leases, oldest
+        # acquisition first. ``active`` is computed here so every consumer
+        # agrees on staleness. (The API layer redacts owner tokens.)
+        limit = max(1, min(int(limit), _MAX_ACTION_LIST_LIMIT))
+        now = datetime.now(tz=timezone.utc)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, owner_token, acquired_at, expires_at, fencing"
+                " FROM session_leases ORDER BY acquired_at, session_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["active"] = _parse_ts(r["expires_at"]) > now
+            result.append(d)
+        return result
+
+    def count_session_leases(self) -> dict[str, int]:
+        """{'active': n, 'expired': m} in one bounded aggregate query."""
+        now = datetime.now(tz=timezone.utc)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT owner_token, expires_at, fencing FROM session_leases"
+            ).fetchall()
+        active = sum(1 for r in rows if _parse_ts(r["expires_at"]) > now)
+        return {"active": active, "expired": len(rows) - active}
+
     def cleanup_expired_confirmations(self) -> int:
         """
         Delete all expired or completed confirmation rows.
@@ -929,7 +1779,6 @@ def _init_db(conn: sqlite3.Connection) -> None:
             finished_at     TEXT,
             owner           TEXT
         );
-
         CREATE INDEX IF NOT EXISTS idx_action_exec_session
             ON action_executions (session_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_action_exec_confirmation
@@ -944,6 +1793,41 @@ def _init_db(conn: sqlite3.Connection) -> None:
             expires_at  TEXT NOT NULL,
             fencing     INTEGER NOT NULL DEFAULT 1
         );
+
+        -- v0.18: explicit UNKNOWN-action reissue audit trail. One row per
+        -- deliberate operator/user reissue; ``request_id`` is the caller's
+        -- idempotency key, so the same request twice returns the same new
+        -- action instead of creating two.
+        CREATE TABLE IF NOT EXISTS action_reissues (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id        TEXT NOT NULL,
+            original_action_id TEXT NOT NULL REFERENCES action_executions(action_id),
+            new_action_id     TEXT NOT NULL REFERENCES action_executions(action_id),
+            created_at        TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_action_reissues_original
+            ON action_reissues (original_action_id, created_at);
+        -- Idempotency: one reissue per (request_id, original action).
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_action_reissues_idempotency
+            ON action_reissues (request_id, original_action_id);
+
+        -- v0.20: personal knowledge base — one durable row per ingested
+        -- document (chunks + embeddings live in the dedicated Chroma
+        -- ``knowledge_base`` collection; this table is the identity/registry
+        -- layer that makes incremental ingestion and removal safe).
+        CREATE TABLE IF NOT EXISTS knowledge_documents (
+            document_id     TEXT PRIMARY KEY,
+            source_path     TEXT NOT NULL,
+            filename        TEXT NOT NULL,
+            media_type      TEXT NOT NULL,
+            size_bytes      INTEGER NOT NULL,
+            content_hash    TEXT NOT NULL,
+            chunk_count     INTEGER NOT NULL DEFAULT 0,
+            parser_version  TEXT NOT NULL,
+            ingested_at     TEXT NOT NULL,
+            modified_at     TEXT
+        );
     """)
     # Lightweight migrations for pre-v0.15 / pre-v0.17 databases —
     # older installations lack these columns; existing data is preserved.
@@ -954,8 +1838,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
     if "context_json" not in existing_cols:
         conn.execute("ALTER TABLE pending_confirmations ADD COLUMN context_json TEXT")
     if "confirmation_id" not in existing_cols:
-        conn.execute("ALTER TABLE pending_confirmations ADD COLUMN confirmation_id TEXT")
-        # Backfill: legacy rows get a durable id so v0.17 code paths (and a
+        conn.execute("ALTER TABLE pending_confirmations ADD COLUMN confirmation_id TEXT")        # Backfill: legacy rows get a durable id so v0.17 code paths (and a
         # paired ledger row) exist for already-parked actions too.
         conn.execute(
             """
@@ -976,6 +1859,18 @@ def _init_db(conn: sqlite3.Connection) -> None:
             FROM pending_confirmations
             WHERE confirmation_id IS NOT NULL
             """
+        )
+    # v0.19: durable resume context on the ledger row itself. Captured at
+    # park time (same transaction), it survives the confirmation pop and any
+    # crash window, so an explicit UNKNOWN reissue can restore the original
+    # paused task. NULL on legacy rows / fresh parks without a plan.
+    ledger_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(action_executions)").fetchall()
+    }
+    if "pause_context_json" not in ledger_cols:
+        conn.execute(
+            "ALTER TABLE action_executions ADD COLUMN pause_context_json TEXT"
         )
     conn.commit()
 

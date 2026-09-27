@@ -29,6 +29,7 @@ from jarvis.core.permissions import PermissionGuard
 from jarvis.core.sandbox import DockerCodeSandbox
 from jarvis.memory.session_store import SessionStore, new_owner_token
 from jarvis.memory.vector_store import get_vector_store
+from jarvis.tools.search_knowledge import SearchKnowledgeTool
 from jarvis.tools import (
     CalculatorTool,
     CodeExecutionTool,
@@ -62,6 +63,7 @@ _TOOL_FACTORIES: tuple = (
     CalculatorTool,
     RememberFactTool,
     RecallFactsTool,
+    SearchKnowledgeTool,
     WriteFileTool,
     VisionAnalyzeTool,
     WebScrapeTool,

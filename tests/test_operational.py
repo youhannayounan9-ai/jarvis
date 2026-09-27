@@ -196,7 +196,13 @@ class TestDoctor:
             store = SessionStore()
             store.close = lambda: None  # type: ignore[method-assign]
             p.return_value = store
-            with patch("jarvis.api.health.check_ollama", return_value=True):
+            with (
+                patch("jarvis.api.health.check_ollama", return_value=True),
+                # v0.18 expanded doctor also probes the configured model;
+                # mock it so this test stays offline (conftest runs with a
+                # fake model name that no real Ollama instance would have).
+                patch("jarvis.maintenance._check_ollama_model", return_value=True),
+            ):
                 code = maintenance.main(["doctor"])
         out = capsys.readouterr().out
         assert code == 0

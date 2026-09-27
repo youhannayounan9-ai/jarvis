@@ -21,6 +21,7 @@ from jarvis.tools.directory_lister import ListDirectoryTool
 from jarvis.tools.file_reader import ReadFileTool
 from jarvis.tools.recall_facts import RecallFactsTool
 from jarvis.tools.remember_fact import RememberFactTool
+from jarvis.tools.search_knowledge import SearchKnowledgeTool
 from jarvis.tools.vision_analyze import VisionAnalyzeTool
 from jarvis.tools.web_scrape import WebScrapeTool
 from jarvis.tools.web_search import WebSearchTool
@@ -42,6 +43,7 @@ __all__ = [
     "ReadFileTool",
     "RecallFactsTool",
     "RememberFactTool",
+    "SearchKnowledgeTool",
     "VisionAnalyzeTool",
     "WebScrapeTool",
     "WebSearchTool",

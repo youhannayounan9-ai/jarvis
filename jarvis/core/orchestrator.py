@@ -395,6 +395,22 @@ class Orchestrator:
         context = pending.get("context") or {}
         confirmation_id = str(pending.get("confirmation_id") or "")
 
+        # v0.19 full-context recovery: this confirmation may be the reissue
+        # of a previously UNKNOWN action (its context was copied verbatim
+        # from the original ledger row). The resolution itself needs no
+        # special casing — the same at-most-once claim and the same
+        # permission flow apply — but the recovery lineage is logged so the
+        # audit trail shows the chain original → reissue → resolution.
+        recovered_from = str(context.get("recovered_from_action") or "")
+        if recovered_from:
+            log.info(
+                "recovered_action_resolved",
+                session_id=session_id,
+                recovered_from=recovered_from,
+                approved=confirmed,
+                confirmation_id=confirmation_id,
+            )
+
         # ── 1. Resolve the action itself (never raises) ────────────────────
         if not confirmed:
             result = f"User denied execution of {tool_name}."
@@ -608,9 +624,14 @@ class Orchestrator:
             else f"User approved {tool_name}, but execution failed."
         )
         if paused_step:
+            # v0.19: label a recovered step truthfully so synthesis can tell
+            # the user the task resumed after an explicit reissue of an
+            # UNKNOWN action (never silently claim the original succeeded).
+            recovered_from = str(context.get("recovered_from_action") or "")
+            recovered_label = ", recovered action" if recovered_from else ""
             completed_steps.append({
                 "step_number": paused_step,
-                "description": f"(paused for confirmation) {outcome_note}",
+                "description": f"(paused for confirmation{recovered_label}) {outcome_note}",
                 "result": tool_result,
             })
 

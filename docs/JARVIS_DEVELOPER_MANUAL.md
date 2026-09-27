@@ -176,8 +176,31 @@ Semantics that matter:
 - A crash after claim but before result cannot strand RUNNING silently: the next startup sweeps RUNNING→UNKNOWN (`recover_unknown_action_executions`). During runtime, a dispatch exception transitions RUNNING→FAILED (a known error is a known result).
 - **Honesty rule:** the ledger makes automatic dispatch at-most-once. It does NOT make the external side effect exactly-once — the tool's effect is not transactionally coupled to SQLite. UNKNOWN exists precisely because that gap is real.
 - Legacy rows (pre-v0.17, no ledger row) fall back to the historical direct dispatch with a warning.
+- **Introspection (v0.18, read-only):** `list_action_executions(state, session_id, limit≤500, newer_than)`, `count_action_executions_by_state`, `get_last_action_execution`, `get_session_lease`, `list_session_leases` (computes `active`), `count_session_leases`, `redact_owner` (`host:pid:component:rand` → `component:rand`). Deterministic newest-first ordering; every query LIMIT-bounded.
+- **Reissue (v0.18, the only mutation of a terminal state's aftermath):** `request_action_reissue(action_id, request_id, max_reissues=3)` — one SQLite transaction that (1) refuses anything not exactly UNKNOWN, (2) returns early when the same `(request_id, action_id)` pair already reissued (idempotency, enforced by the `idx_action_reissues_idempotency` UNIQUE index even across processes), (3) enforces the per-original ceiling, (4) refuses when the session has an **active** pending confirmation (one per session; completed/expired leftovers are cleaned and their stranded PENDING ledger rows closed, mirroring `save_pending_confirmation`'s replace semantics), then inserts the NEW PENDING ledger row, its durable `pending_confirmations` row (`confirmation_id = reissue:{request_id}:{original_action_id}`, standard 10-minute TTL), and the `action_reissues` audit row. The original row is never modified. The new action resolves through the ordinary `handle_confirmation` path — approval claims it at-most-once exactly like any parked action. Logging: `action_reissue_requested` (API layer), `action_reissue_created` (store), `action_reissue_duplicate_request` (replay).
+- **Full-context recovery (v0.19):** every park now captures the pause context onto the LEDGER ROW itself (`action_executions.pause_context_json`, same transaction as the PENDING row; `ALTER TABLE` migration for existing DBs). Reissue copies that context verbatim onto the new confirmation — plus `recovered_from_action` / `recovered_request_id` lineage markers — so `handle_confirmation`'s existing resume path runs unchanged: the recovered step is labeled `, recovered action` in `completed_steps`, remaining plan steps execute under the ORIGINAL budget, and final synthesis completes the task. When a reissued action goes UNKNOWN again, the context is recovered **transitively**: the copy walks back through `action_reissues` (bounded by the ceiling) to the chain origin's ledger row. Malformed/absent context degrades to the pre-v0.19 raw-result reply (logged as `reissue_context_corrupt_degrades`); resolution of a recovered action logs `recovered_action_resolved`. Recovery cannot skip validation: the only execution path is the normal claim + PermissionGuard + dispatch. The operator decision surface is `get_action_recovery_preview` (has_context / recoverable / original_request truncated to 300 / pending steps / budget — never the raw context).
+- **Session timeline (v0.19):** `get_session_timeline(session_id, limit≤500)` merges `messages` (kind only, no content), `pending_confirmations`, `action_executions`, `action_reissues`, and `session_leases` (owner redacted) into one (ts, seq)-ordered, LIMIT-bounded list — the shared data layer behind `GET /sessions/{id}/timeline`, `maintenance inspect --session`, and the dashboard. Safe metadata only.
+- **Retention (v0.19):** `cleanup_operational_records(terminal_actions_days=30, reissues_days=90, leases_days=30, dry_run=False)` — one transaction; deletes only SUCCEEDED rows past retention (plus FAILED rows whose confirmation is completed), never PENDING/RUNNING/UNKNOWN or rows referenced by `action_reissues`; audit rows go only when BOTH linked actions are gone; expired/orphaned leases purge. `dry_run=True` is a verified no-mutation count pass.
+- **Personal knowledge base (v0.20):** `jarvis/memory/knowledge_parsing.py` (parsers: TXT/MD/code/JSON via stdlib, PDF via `pypdf` with page preservation; deterministic lossless paragraph-first chunker, 1200/150 defaults, `_MAX_PARAGRAPH_CHARS` hard-split guard, stable chunk ids `{document_id}:{index}:{hash16}`) and `jarvis/memory/knowledge.py` (`KnowledgeService`: explicit-path ingestion inside `FILE_READER_ALLOWED_DIR` with unconditional credential-file refusal; content-hash dedup — unchanged → skip, same bytes new path → shared entry, changed → delete-then-replace with no stale chunks; bounded retrieval with `MAX_TOP_K`=20 / `MAX_EVIDENCE_CHARS`=6000 and metadata-only citations). Documents live in the dedicated `knowledge_base` Chroma collection — NEVER in `long_term_memory`; the `search_knowledge` tool returns evidence inside explicit untrusted-data delimiters. Tests: `tests/test_knowledge_rag.py` (32 deterministic cases: lifecycle, PDF pages, citations, adversarial framing, separation, path security, API lifecycle over real HTTP).
 
-Tests: `tests/test_action_idempotency.py` (24 cases: atomic claims incl. an 8-thread barrier race, duplicate/triple approval, approval-after-failure, UNKNOWN never re-dispatched, denial attempts 0, restart between park and approval, migration backfill) and the concurrent-approval cases in `tests/test_session_concurrency.py`.
+```
+  UNKNOWN (crash ambiguity, never auto-retried)
+      │  operator inspects: /actions, unknown-actions, GET /actions/{id},
+      │                    dashboard Operations → UNKNOWN actions,
+      │                    maintenance inspect --action <id>
+      │  operator decides: POST /actions/{id}/reissue  or  maintenance reissue
+      │                    (dashboard: ack checkbox + final confirmation)
+      ▼
+  NEW action_id (PENDING, attempt 0) ─── audit row: original → new
+      │                                   context copied from original row
+      │                                   (transitively across the chain)
+      └── normal flow: approve → claim → dispatch once → resume remaining
+                       plan steps under the original budget → synthesis
+                       deny    → FAILED without any dispatch (denial recorded)
+                       (original UNKNOWN row remains untouched for audit)
+```
+
+Tests: `tests/test_action_idempotency.py` (24 cases: atomic claims incl. an 8-thread barrier race, duplicate/triple approval, approval-after-failure, UNKNOWN never re-dispatched, denial attempts 0, restart between park and approval, migration backfill), the concurrent-approval cases in `tests/test_session_concurrency.py`, `tests/test_operator_introspection.py` (73 cases: introspection filters/pagination/safe-metadata, lease staleness/redaction, full reissue lifecycle incl. idempotent replay, ceiling, audit chain, active-confirmation refusal, unauthenticated reissue → 401, wrong state → 409, doctor scenarios, CLI output/exit codes), `tests/test_full_recovery.py` (27 cases: context capture/survival, full-context reissue with real-orchestrator approval/denial/nested/second-UNKNOWN/budget/malformed/missing-session, timeline ordering/causality/bounds/isolation/leak-proofing, retention protection + dry-run + audit integrity), and `tests/test_operator_experience.py` (11 cases: the new endpoints on a REAL uvicorn server via the REAL client incl. auth, and dashboard-backend parity).
 
 ---
 
@@ -185,8 +208,8 @@ Tests: `tests/test_action_idempotency.py` (24 cases: atomic claims incl. an 8-th
 
 | Store | Tech | What lives there |
 |---|---|---|
-| Session state | SQLite (WAL) via `SessionStore` | Sessions, messages (full fidelity incl. tool payloads), pending confirmations, execution ledger (`action_executions`), session leases (`session_leases`), rate-limit events (`rate_limit_events`, only when the durable limiter is enabled) |
-| Long-term semantic | ChromaDB via `VectorStore` (`all-MiniLM-L6-v2` local embeddings, cosine HNSW) | Facts written by `remember_fact`, searched by `recall_facts` (top-3) |
+| Session state | SQLite (WAL) via `SessionStore` | Sessions, messages (full fidelity incl. tool payloads), pending confirmations, execution ledger (`action_executions`), session leases (`session_leases`), reissue audit (`action_reissues`), knowledge registry (`knowledge_documents`, v0.20), rate-limit events (`rate_limit_events`, only when the durable limiter is enabled) |
+| Long-term semantic | ChromaDB via `VectorStore` (`all-MiniLM-L6-v2` local embeddings, cosine HNSW) | **Two collections:** `long_term_memory` — facts written by `remember_fact`, searched by `recall_facts` (top-3); `knowledge_base` (v0.20) — ingested document chunks with trace-back metadata, searched by `search_knowledge` (bounded top-k) |
 
 - **Session vs long-term:** session history = current conversation window; long-term = cross-session facts tied to `current_session_id` metadata. `VectorStore` is a process-wide singleton; `JarvisRuntime.start_session()` binds each new session to it.
 - **SQLite as the single source of truth:** everything the model "remembers" from the conversation is rebuilt from SQLite every turn (bounded by ContextManager); nothing is kept only in process memory.
@@ -440,15 +463,39 @@ Did context update?             add_message persisted; tool_output_clamped for b
 Did synthesis work?             response_ready with duration_ms in logs
 ```
 
-Extra levers: `python -m jarvis.maintenance doctor` (DB, Ollama, sandbox posture, pending confirmations); `/history` in the CLI; API `X-Request-ID` correlation; `GET /sessions/{id}/history` for the exact persisted turns.
+Extra levers: `python -m jarvis.maintenance doctor` (DB, Ollama + model availability, stale leases, UNKNOWN/PENDING/RUNNING action counts, sandbox posture, pending confirmations, voice deps — inspect/diagnose only, no silent repairs); `/history` in the CLI; API `X-Request-ID` correlation; `GET /sessions/{id}/history` for the exact persisted turns.
+
+### Maintenance CLI (v0.18)
+
+```
+uv run python -m jarvis.maintenance actions --state UNKNOWN --json
+uv run python -m jarvis.maintenance unknown-actions        # + why + reissue guidance
+uv run python -m jarvis.maintenance sessions --expired
+uv run python -m jarvis.maintenance reissue --action <id> --request-id <unique-id> [--yes]
+uv run python -m jarvis.maintenance doctor
+cleanup / expire-confirmations / stats   (unchanged)
+```
+
+Contract: `actions`, `unknown-actions`, `sessions` are **strictly read-only** (owner tokens redacted, `tool_args`/result bodies never printed, `--json` for scripts); `reissue` is the one mutating command (pre-checks state → refuses non-UNKNOWN with exit 1; interactive `yes` prompt unless `--yes`; reports the idempotent-replay note when the request id was already served); `doctor` reports failures with a non-zero exit for alerting and logs a structured `doctor_check` event. Exit codes: 0 ok, 1 error/refused.
 
 ---
 
-## 26. Known Architectural Limitations (v0.17)
+## 26. Known Architectural Limitations (v0.20)
 
-- **SQLite is the coordination substrate:** session leases, the execution ledger, and the durable rate limiter are correct across processes sharing ONE database file, but SQLite writes serialize — high-write concurrency throughput is bounded. Not a distributed system: replicas on different files do not coordinate.
+- **Knowledge base is single-user and local by design:** one Chroma `knowledge_base` collection per `VECTOR_DB_PATH`; no ACLs, no multi-tenant scoping, no sync (ingestion is explicit-path, never crawling).
+- **PDF parsing is text-layer only:** scanned/image PDFs yield empty pages (no OCR); complex layouts can garble reading order. `pypdf` extraction failures degrade to empty pages, never to fabricated content.
+- **Chunking is character-based:** paragraph-first with 1200/150 defaults; no token-aware splitting and no semantic boundaries beyond markdown headings (`#` lines feed `section` metadata).
+- **Retrieval is embedding-only:** pure `all-MiniLM-L6-v2` cosine; no keyword/hybrid stage, no reranker. Distance threshold filtering exists but is off by default; irrelevant-but-ranked results are possible (the tool's honest `NO_RELEVANT_EVIDENCE` reply covers the true-empty case only).
+- **Evidence is bounded, not tokenized:** `MAX_EVIDENCE_CHARS`=6000 caps the injected block deterministically; a token-exact budget is future work.
+- **Prompt-injection defense is framing + tool discipline:** the `DOCUMENT EVIDENCE` delimiters and system-prompt rules tell the model to treat document text as data; the structural boundaries remain PermissionGuard, tool schema validation, and the execution ledger. A sufficiently steered 7B model reading malicious documents is a documented residual risk — never grant evidence paths to write/execute tools.
+- **Test-isolation guard:** `tests/conftest.py` autouse `_offline_llm_guard` refuses `litellm.completion` in every test not marked `live_llm` — the Planner captures its client at construction, so name-patching `chat_completion` alone cannot stop a real network call (this caused an observed multi-minute hang when Ollama was wedged).
+- **SQLite is the coordination substrate:** session leases, the execution ledger, the reissue audit trail, the knowledge registry, and the durable rate limiter are correct across processes sharing ONE database file, but SQLite writes serialize — high-write concurrency throughput is bounded. Not a distributed system: replicas on different files do not coordinate.
 - **Lease TTL residual race:** a single turn that outlives `SESSION_LEASE_TTL_SECONDS` (300 s) can lose cross-process exclusivity near the TTL boundary (in-process mutex still holds). Turn durations are far below the TTL today.
-- **UNKNOWN resolution is manual by design:** an action whose crash state is UNKNOWN is reported (`ACTION_EXECUTION_STATE_UNKNOWN`) and never auto-rerun; the user re-issues it deliberately. No UI for curating UNKNOWN actions exists yet.
+- **UNKNOWN resolution is manual by design:** an action whose crash state is UNKNOWN is reported (`ACTION_EXECUTION_STATE_UNKNOWN`) and never auto-rerun. v0.18 adds inspection (API + CLI) and an explicit, idempotent, bounded reissue — still operator/user-driven, still no automatic recovery. No dashboard UI for curating UNKNOWN actions exists yet.
+
+- **SQLite is the coordination substrate:** session leases, the execution ledger, the reissue audit trail, and the durable rate limiter are correct across processes sharing ONE database file, but SQLite writes serialize — high-write concurrency throughput is bounded. Not a distributed system: replicas on different files do not coordinate.
+- **Lease TTL residual race:** a single turn that outlives `SESSION_LEASE_TTL_SECONDS` (300 s) can lose cross-process exclusivity near the TTL boundary (in-process mutex still holds). Turn durations are far below the TTL today.
+- **UNKNOWN resolution is manual by design:** an action whose crash state is UNKNOWN is reported (`ACTION_EXECUTION_STATE_UNKNOWN`) and never auto-rerun. v0.18 adds inspection (API + CLI) and an explicit, idempotent, bounded reissue — still operator/user-driven, still no automatic recovery. No dashboard UI for curating UNKNOWN actions exists yet.
 - **Durable rate limiter is opt-in:** the deployment default limiter stays in-memory; `make_durable_limiter(store)` exists for multi-process deployments (see deploy/README.md).
 - **Lexical graders:** no semantic judge; pass ≠ correct.
 - **Prompt-injection defense:** prompt rules are defense-in-depth only; the structural boundary is permissions/confirmation, and within allowed tools a 7B model can still be steered by crafted content.

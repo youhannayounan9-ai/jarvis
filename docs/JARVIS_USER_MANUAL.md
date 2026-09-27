@@ -277,7 +277,91 @@ curl -X POST http://localhost:8000/sessions/$SID/confirm \
 
 **Authentication behavior:** empty `JARVIS_API_KEY` = local trust. Set → `Authorization: Bearer <key>` (or `X-API-Key`) required on everything except `/health` + docs. Constant-time compare. Wrong/missing key → 401; whitespace-only key config → 503 (fail-closed). Rate limit: 60 req/60s per client → 429 + `Retry-After` (`0` disables). Same-session concurrent turns → 409 (v0.17: enforced across processes via a database-backed session lease, so a second JARVIS process cannot interleave with your session either; a crashed process's lease self-expires).
 
-**Confirmed actions execute at most once (v0.17):** every approved high-risk action gets a durable execution record. Approving twice, retrying the request, or approving after a crash returns the already-recorded outcome instead of running the tool again. If a crash leaves the outcome genuinely unknown (executed, but the result was never recorded), JARVIS **refuses to re-run it automatically** and reports `ACTION_EXECUTION_STATE_UNKNOWN` — re-issue the request deliberately if you want it redone. Denials never execute the tool at all.
+**Confirmed actions execute at most once (v0.17):** every approved high-risk action gets a durable execution record. Approving twice, retrying the request, or approving after a crash returns the already-recorded outcome instead of running the tool again. If a crash leaves the outcome genuinely unknown (executed, but the result was never recorded), JARVIS **refuses to re-run it automatically** and reports `ACTION_EXECUTION_STATE_UNKNOWN` — re-issue the request deliberately if you want it redone (see below). Denials never execute the tool at all.
+
+**Inspecting and recovering actions (v0.18):** the action ledger and session leases are inspectable, and an UNKNOWN action can be deliberately re-issued. There is **no automatic recovery**: an UNKNOWN action stays UNKNOWN until a human decides.
+
+```bash
+# What actions exist? (add ?state=UNKNOWN&session_id=…&limit=…; bounded at 500)
+curl http://localhost:8000/actions
+
+# One action's safe metadata (ids, tool, state, timestamps — never tool arguments)
+curl http://localhost:8000/actions/<action_id>
+
+# Which sessions are leased, by whom (redacted), until when?
+curl http://localhost:8000/sessions/leases
+
+# Deliberately re-issue an UNKNOWN action (NEW action id; original stays UNKNOWN
+# for audit; the new action goes through the normal approval flow).
+curl -X POST http://localhost:8000/actions/<action_id>/reissue \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "recovery-2026-09-27-001"}'
+```
+
+Reissue semantics:
+
+- **Explicit only.** Read endpoints never mutate anything; `POST /actions/{id}/reissue` and the `reissue` CLI command are the only mutating operations, and they refuse anything whose state is not exactly UNKNOWN.
+- **Idempotent per request id.** Submitting the same `request_id` twice returns the **same** new action — an accidental double-submit cannot create two actions.
+- **Bounded.** One original action can be re-issued at most `MAX_REISSUES_PER_ACTION` (3) times.
+- **Normal permission flow.** The reissued action is parked as a fresh confirmation for its session; nothing executes until it is approved (or denied) like any other high-risk action. If that session already has an active confirmation awaiting an answer, reissue is refused (409) instead of silently replacing it.
+- **Audited.** Every reissue is recorded (`action_reissues` table); the original row is never modified.
+- **Authentication applies.** With `JARVIS_API_KEY` set, all `/actions*` and `/sessions/leases` endpoints — including reissue — require the key; unauthenticated calls get 401.
+
+CLI equivalents (see `python -m jarvis.maintenance --help`):
+
+```bash
+python -m jarvis.maintenance actions --state UNKNOWN
+python -m jarvis.maintenance unknown-actions          # what is ambiguous, why, what next
+python -m jarvis.maintenance sessions --expired        # stale leases
+python -m jarvis.maintenance reissue --action <id> --request-id <unique-id>
+python -m jarvis.maintenance inspect --session <id>    # causal timeline (or --action <id> for one row)
+python -m jarvis.maintenance cleanup --operational --dry-run   # retention preview
+python -m jarvis.maintenance knowledge list            # v0.20 knowledge base
+python -m jarvis.maintenance doctor                    # DB, Ollama + model, leases, UNKNOWN counts, sandbox, voice deps
+```
+
+**Operator dashboard (v0.19):** the Streamlit UI has an **Operations** view (sidebar → 🛠️ Operations): recent actions with state/session filters, UNKNOWN actions with recovery guidance, session leases, and per-session timelines. Viewing never changes anything; reissue is the only mutation and asks twice (an acknowledgement checkbox, then a final confirmation). Errors from the API (down, wrong key, 404, 409, 429) appear as messages — the page never crashes.
+
+**Full-context recovery (v0.19):** since v0.19 the original task context (request, plan, completed steps, budgets) is captured when an action is parked. Reissuing an UNKNOWN action copies that context onto the new action's confirmation, so **approving the reissued action continues the original task** — remaining plan steps run and a final answer is synthesized — instead of stopping at a bare result. A denial still never executes the tool. Nothing runs without the normal approval; UNKNOWN is still never retried automatically.
+
+---
+
+## 8b. Personal Knowledge Base (v0.20)
+
+Two different stores — keep them straight:
+
+| | **Personal memory** | **Knowledge base (v0.20)** |
+|---|---|---|
+| What it is | Facts about you ("I prefer Python") | Documents you own (PDFs, notes, code) |
+| Tools | `remember_fact` / `recall_facts` | `search_knowledge` (+ CLI/API management) |
+| Storage | Chroma `long_term_memory` | Chroma `knowledge_base` + SQLite registry |
+| Semantics | durable until you delete | re-ingest replaces older versions |
+
+**Ingest a document (explicit paths only — JARVIS never crawls your computer):**
+
+```bash
+python -m jarvis.maintenance knowledge ingest --path docs/ai_roadmap.md
+python -m jarvis.maintenance knowledge list
+python -m jarvis.maintenance knowledge search --query "LangGraph phase five" --top-k 5
+python -m jarvis.maintenance knowledge inspect --id <document_id>
+python -m jarvis.maintenance knowledge reindex --id <document_id>
+python -m jarvis.maintenance knowledge remove --id <document_id>      # asks for 'yes'
+```
+
+- **Supported formats:** `.txt`, `.md`, source code (`.py`, `.js`, `.ts`, `.java`, `.go`, …), `.json`, `.csv`, `.yaml` — and **PDF** (page numbers preserved) via the new `pypdf` dependency.
+- **Path safety:** the resolved file must be inside `FILE_READER_ALLOWED_DIR` (same boundary as `read_file`); traversal and symlink escapes are rejected; `.env`, key/certificate files, and secret-named text files are refused outright.
+- **Incremental:** re-ingesting an unchanged file does nothing (no re-embedding); a changed file replaces its old chunks completely.
+- **Citations:** retrieval results carry `[Source: <file>, page N, chunk M]` derived only from stored metadata — never invented. If the knowledge base lacks evidence, JARVIS says so instead of guessing.
+- **Injection safety:** retrieved document text is delivered to the model as clearly-marked *evidence data*, never as instructions. A document containing "ignore all previous instructions" is still just text to reason about.
+
+Then just ask in chat:
+
+- *"Search my AI Engineering roadmap for LangGraph."*
+- *"What does my university PDF say about neural networks?"*
+- *"Compare what my two roadmap documents say about phase 5."*
+- *"Does my knowledge base contain anything about RAG evaluation?"*
+
+The Streamlit dashboard gained a **📚 Knowledge** view: indexed documents, explicit ingest-by-path, and search with per-chunk citations.
 
 **Errors carry correlation IDs:** every response has `X-Request-ID` (and `/chat` echoes it as `request_id`); the server log line under that ID holds the real error — clients never see internals.
 
@@ -472,6 +556,11 @@ Durable means restart-safe: the parked action + resume context live in SQLite (T
 | API 429 | Rate limit → honor `Retry-After`, or raise/disable in `.env` (`RATE_LIMIT_REQUESTS=0`). |
 | API 409 on `/chat` | Another turn is running on that session — wait or use a different session. |
 | `ACTION_REQUIRES_CONFIRMATION…` | Not an error — turn is parked. `/confirm` / `/deny` (CLI) or `POST /sessions/{id}/confirm` (API). TTL is 10 minutes. |
+| `ACTION_EXECUTION_STATE_UNKNOWN…` | A crash left the outcome ambiguous; JARVIS will NOT re-run it automatically. Inspect (`python -m jarvis.maintenance unknown-actions` or `GET /actions?state=UNKNOWN`), verify the real-world effect, then re-issue deliberately (`reissue --action <id> --request-id <unique-id>`, max 3 per action). |
+| API 409 on `/actions/{id}/reissue` | The action is not UNKNOWN, the reissue limit (3) is reached, or the session already has an active confirmation — read the `detail` message. |
+| Dashboard shows "Authentication required" | The API has `JARVIS_API_KEY` set — set `JARVIS_CLIENT_API_KEY` to the same value so the dashboard can read the Operations view. |
+| `recovery: no durable resume context…` in `unknown-actions`/`inspect` | A pre-v0.19 UNKNOWN row (or a park without a plan) — reissue still works; the result is reported directly instead of resuming a plan. |
+| `doctor` reports stale leases | Another process died holding a lease. `python -m jarvis.maintenance sessions --expired` lists them; they self-expire after the TTL (300 s) and are safe to take over. |
 | Vision errors (`Failed to analyze image`) | `ollama pull llava`; check the path is inside `FILE_READER_ALLOWED_DIR`. |
 | Voice: "ffmpeg not found" | `winget install FFmpeg` (Windows) then **restart the terminal** so PATH updates. Verify `ffmpeg -version`. |
 | Voice: no speech detected | Mic permissions; speak during the "Listening…" window; raise `VOICE_RECORD_SECONDS`. |

@@ -183,6 +183,16 @@ uv run streamlit run ui/dashboard.py
   approvals return the recorded outcome instead of re-executing, and actions
   whose outcome is unknown are never automatically re-run
   (`ACTION_EXECUTION_STATE_UNKNOWN` report; see docs/JARVIS_DEVELOPER_MANUAL.md §8).
+- **Operational endpoints (v0.18)** — `GET /actions`, `GET /actions/{id}`,
+  `GET /sessions/leases` are read-only introspection (safe metadata; owner
+  tokens redacted; tool arguments and result bodies never exposed).
+  `POST /actions/{id}/reissue` is the ONE mutating operational endpoint:
+  it deliberately re-issues an UNKNOWN action as a NEW action id (idempotent
+  per `request_id`, max 3 per original, audited in `action_reissues`). It
+  sits behind the same auth + rate limiting as every other mutating
+  endpoint — with `JARVIS_API_KEY` set, an unauthenticated caller cannot
+  trigger a reissue (401). Reading state is deliberately easier than
+  reissuing it: never expose a reissue-capable key to a read-only consumer.
 - **Auth** — see README (`JARVIS_API_KEY`, Bearer/X-API-Key, constant-time).
 
 ---
@@ -242,6 +252,45 @@ security control, not an optimization:
   `step_execute_start/done`) — aggregate with any JSON log shipper.
 - `cleanup_old_sessions(max_age_days=30)` exists on the store; schedule it
   (cron/OS task) — the service does not do background jobs itself.
+- **Maintenance CLI (v0.18/v0.19)** — schedule `python -m jarvis.maintenance
+  doctor` (exit code 0/1 by check results) and alert on non-zero. For
+  recovery: `actions --state UNKNOWN`, `unknown-actions`, `sessions
+  --expired`, `inspect --session <id> / --action <id>` are read-only;
+  `reissue --action <id> --request-id <unique> [--yes]` is the one
+  deliberate mutation. Retention: schedule `cleanup --operational
+  --dry-run` weekly to preview, then without `--dry-run` (defaults:
+  terminal ledger rows 30 d, reissue audit rows 90 d but only when both
+  linked actions are gone, expired/orphaned leases 30 d; PENDING/RUNNING/
+  UNKNOWN and chain-linked rows are always protected). New v0.18/v0.19 log
+  events to ship: `action_marked_unknown`, `action_reissue_requested`,
+  `action_reissue_created`, `action_reissue_duplicate_request`,
+  `recovered_action_resolved`, `reissue_context_corrupt_degrades`,
+  `session_lease_recovered_from_stale`, `cleanup_operational_records`,
+  `doctor_check`. New schema: `action_reissues` table (`CREATE TABLE IF NOT
+  EXISTS`) and `action_executions.pause_context_json` (`ALTER TABLE` on
+  next startup — no manual migration needed).
+- **Operator dashboard (v0.19)** — the Streamlit Operations view is a
+  client of the same API: give it `JARVIS_CLIENT_API_KEY` (same value as
+  the server's `JARVIS_API_KEY`) when auth is enabled, or every Operations
+  read renders an authentication message. The dashboard performs no
+  background jobs and no writes on render; its only mutation is reissue,
+  which requires two explicit interactions and then behaves exactly like
+  the API/CLI path (idempotent, ceiling-bounded, audited).
+- **Personal knowledge base (v0.20)** — documents ingest into
+  `VECTOR_DB_PATH` under a dedicated `knowledge_base` Chroma collection
+  (plus `knowledge_documents` rows in `DB_PATH`; both created lazily —
+  no manual migration). Path boundary: ingestion accepts only files whose
+  resolved path is inside `FILE_READER_ALLOWED_DIR` (default `.` — set it
+  to a dedicated documents directory in production so the agent cannot
+  index the whole checkout). Credential-like files are refused outright.
+  New dependency: `pypdf` (PDF text extraction, page metadata). New API
+  surface: `/knowledge/documents`, `/knowledge/documents/{id}`,
+  `/knowledge/ingest`, `/knowledge/search` — all behind the same auth +
+  rate limiting; ingest/delete are mutating and 401 without the key.
+  New log events: `knowledge_ingested`, `knowledge_ingest_unchanged`,
+  `knowledge_reindex_stale_chunks_removed`, `knowledge_document_removed`,
+  `knowledge_chunks_added/deleted`, `knowledge_search`,
+  `knowledge_api_ingest/remove`, `knowledge_ingest_refused`.
 
 ## 7. Live-model evaluation procedure
 

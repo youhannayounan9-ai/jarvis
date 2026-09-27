@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from typing import Any
@@ -197,6 +198,113 @@ class JarvisClient:
 
     def tools(self) -> list[dict[str, Any]]:
         return self._request("GET", "/tools", timeout=DEFAULT_TIMEOUT_CONNECT)
+
+    # ── v0.19 operator endpoints ─────────────────────────────────────────────
+
+    @staticmethod
+    def _qs(params: dict[str, Any]) -> str:
+        """URL-encode non-empty params (urllib-based; no extra deps)."""
+        clean = {
+            k: v for k, v in params.items()
+            if v is not None and v != ""
+        }
+        return f"?{urllib.parse.urlencode(clean)}" if clean else ""
+
+    def list_actions(
+        self,
+        state: str | None = None,
+        session_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Read-only execution-ledger report (safe metadata only)."""
+        qs = self._qs({"limit": limit, "state": state, "session_id": session_id})
+        return self._request(
+            "GET", f"/actions{qs}", timeout=DEFAULT_TIMEOUT_CONNECT
+        )
+
+    def get_action(self, action_id: str) -> dict[str, Any]:
+        """One ledger row's safe metadata. Raises JarvisClientError 404."""
+        return self._request(
+            "GET",
+            f"/actions/{action_id}",
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def list_leases(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Read-only session-lease report (owner redacted server-side)."""
+        return self._request(
+            "GET",
+            f"/sessions/leases{self._qs({'limit': limit})}",
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def reissue_action(
+        self, action_id: str, request_id: str | None = None
+    ) -> dict[str, Any]:
+        """Explicit UNKNOWN-action reissue (mutating; server auth applies).
+
+        Without a client request_id the server generates one and echoes it
+        in the response — retry the SAME request_id to stay idempotent.
+        Always sends a JSON body (``{}`` when no key), since the endpoint's
+        body model is required even though its field is optional.
+        """
+        body: dict[str, Any] = {"request_id": request_id} if request_id else {}
+        return self._request(
+            "POST", f"/actions/{action_id}/reissue", body
+        )
+
+    def session_timeline(
+        self, session_id: str, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Read-only causal timeline (safe metadata only)."""
+        return self._request(
+            "GET",
+            f"/sessions/{session_id}/timeline{self._qs({'limit': limit})}",
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    # ── v0.20 knowledge base ───────────────────────────────────────────────
+
+    def list_knowledge_documents(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self._request(
+            "GET",
+            f"/knowledge/documents{self._qs({'limit': limit})}",
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def get_knowledge_document(self, document_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/knowledge/documents/{document_id}",
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def ingest_knowledge_document(
+        self, path: str, target_chars: int = 1200, overlap_chars: int = 150
+    ) -> dict[str, Any]:
+        """Explicit single-document ingestion (server enforces path safety)."""
+        return self._request(
+            "POST",
+            "/knowledge/ingest",
+            {
+                "path": path,
+                "target_chars": target_chars,
+                "overlap_chars": overlap_chars,
+            },
+        )
+
+    def search_knowledge(
+        self, query: str, top_k: int = 4, source: str | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"query": query, "top_k": top_k}
+        if source:
+            body["source"] = source
+        return self._request("POST", "/knowledge/search", body)
+
+    def remove_knowledge_document(self, document_id: str) -> dict[str, Any]:
+        return self._request(
+            "DELETE", f"/knowledge/documents/{document_id}"
+        )
 
 
 __all__ = [

@@ -31,8 +31,8 @@ class TestRuntimeAssembly:
         expected = {
             "get_current_datetime", "web_search", "wikipedia_summary",
             "read_file", "list_directory", "calculator",
-            "remember_fact", "recall_facts", "write_file",
-            "vision_analyze", "web_scrape",
+            "remember_fact", "recall_facts", "search_knowledge",
+            "write_file", "vision_analyze", "web_scrape",
         }
         assert expected == tools
         rt.close()

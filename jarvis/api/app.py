@@ -46,14 +46,32 @@ from jarvis.api.health import deep_health
 from jarvis.api import ratelimit as _ratelimit
 from jarvis.api.ratelimit import client_key
 from jarvis.api.schemas import (
+    ActionInfo,
     ChatRequest,
     ChatResponse,
     ConfirmationRequest,
     HealthResponse,
+    KnowledgeDocumentInfo,
+    KnowledgeIngestRequest,
+    KnowledgeIngestResponse,
+    KnowledgeRemoveResponse,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResponse,
+    KnowledgeSearchResult,
+    LeaseInfo,
     PendingAction,
+    ReissueRequest,
+    ReissueResponse,
     SessionCreated,
+    TimelineEvent,
     ToolInfo,
 )
+from jarvis.memory.session_store import (
+    MAX_REISSUES_PER_ACTION,
+    SessionStore,
+    redact_owner,
+)
+from jarvis.memory.session_store import ActionExecution as _ActionExecution
 
 # Details are never leaked to clients: exception strings can embed internal
 # paths or hostnames. Clients get a generic message + the request id; the
@@ -70,7 +88,7 @@ log = get_logger(__name__)
 app = FastAPI(
     title="JARVIS API",
     description="Local-first AI assistant — agent runtime over HTTP.",
-    version="0.17.0",
+    version="0.20.0",
 )
 
 # ── Runtime dependency (overridable in tests) ─────────────────────────────────
@@ -436,3 +454,276 @@ def list_tools(
         ToolInfo(name=name, risk_level=runtime.registry.get_tool_risk_level(name))
         for name in runtime.registry.list_tools()
     ]
+
+
+# ── Operator introspection + explicit UNKNOWN recovery (v0.18) ────────────────
+# Reading is protected by the same auth as every other endpoint; the one
+# MUTATING operation (reissue) goes through the same _AUTH dependency and can
+# never be triggered by a GET.
+
+
+def _safe_action_info(store: SessionStore, row: "ActionExecution") -> ActionInfo:
+    """Project a ledger row to its safe, disclosable metadata."""
+    origin = store.get_reissue_origin(row.action_id)
+    return ActionInfo(
+        action_id=row.action_id,
+        session_id=row.session_id,
+        confirmation_id=row.confirmation_id,
+        tool_name=row.tool_name,
+        risk_level=row.risk_level,
+        state=row.state,
+        attempt=row.attempt,
+        created_at=row.created_at,
+        claimed_at=row.claimed_at,
+        finished_at=row.finished_at,
+        reissue_depth=store.count_reissues_for_action(row.action_id),
+        reissued_from=origin,
+    )
+
+
+@app.get("/actions", response_model=list[ActionInfo])
+def list_actions(
+    request: Request,
+    state: str | None = Query(
+        default=None,
+        description="Filter by ledger state (PENDING/RUNNING/SUCCEEDED/FAILED/UNKNOWN).",
+    ),
+    session_id: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=50, ge=1, le=500),
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> list[ActionInfo]:
+    """Read-only execution-ledger inspection (bounded, newest first)."""
+    _enforce_rate_limit(request)
+    try:
+        rows = runtime.store.list_action_executions(
+            state=state, session_id=session_id, limit=limit
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return [_safe_action_info(runtime.store, r) for r in rows]
+
+
+@app.get("/actions/{action_id}", response_model=ActionInfo)
+def get_action(
+    action_id: str,
+    request: Request,
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> ActionInfo:
+    """Read-only detail for one ledger row (404 when unknown)."""
+    _enforce_rate_limit(request)
+    row = runtime.store.get_action_execution(action_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown action_id.")
+    return _safe_action_info(runtime.store, row)
+
+
+@app.get("/sessions/leases", response_model=list[LeaseInfo])
+def list_leases(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> list[LeaseInfo]:
+    """
+    Read-only session-lease inspection: who (redacted) holds which session,
+    until when, at which fencing token. Stale leases show ``active: false``.
+    """
+    _enforce_rate_limit(request)
+    return [
+        LeaseInfo(
+            session_id=lease["session_id"],
+            owner=redact_owner(lease["owner_token"]),
+            acquired_at=lease["acquired_at"],
+            expires_at=lease["expires_at"],
+            fencing=lease["fencing"],
+            active=lease["active"],
+        )
+        for lease in runtime.store.list_session_leases(limit=limit)
+    ]
+
+
+@app.post("/actions/{action_id}/reissue", response_model=ReissueResponse)
+def reissue_action(
+    action_id: str,
+    payload: ReissueRequest,
+    request: Request,
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> ReissueResponse:
+    """
+    Explicitly re-issue an UNKNOWN action as a NEW action identity.
+
+    This is NOT a retry and not automatic: it mints a fresh PENDING ledger
+    row (new action_id) that must pass the normal permission/confirmation
+    flow before anything executes. Idempotent per request_id; bounded by
+    MAX_REISSUES_PER_ACTION; the original row stays UNKNOWN for audit.
+    """
+    _enforce_rate_limit(request)
+    store = runtime.store
+    # Idempotency key: client-supplied when given; otherwise server-generated
+    # (returned in the response so the client can replay it). A server key is
+    # NOT an authorization credential — auth is enforced by the dependency.
+    request_id = payload.request_id or f"srv-{uuid.uuid4().hex}"
+    log.info(
+        "action_reissue_requested",
+        action_id=action_id,
+        request_id=request_id,
+    )
+    # Was this exact request already satisfied before this call? (The store
+    # enforces true idempotency via a UNIQUE index; this flag is informational.)
+    already_served = any(
+        r["request_id"] == request_id
+        for r in store.get_reissue_chain(action_id)
+    )
+    try:
+        new_id = store.request_action_reissue(action_id, request_id)
+    except ValueError as e:
+        msg = str(e)
+        status = 404 if "unknown action_id" in msg else 409
+        raise HTTPException(status_code=status, detail=msg) from e
+    return ReissueResponse(
+        original_action_id=action_id,
+        new_action_id=new_id,
+        state=store.get_action_execution(new_id).state,
+        reissue_depth=store.count_reissues_for_action(action_id),
+        max_reissues=MAX_REISSUES_PER_ACTION,
+        reused_existing=already_served,
+        request_id=request_id,
+    )
+
+
+@app.get("/sessions/{session_id}/timeline", response_model=list[TimelineEvent])
+def get_session_timeline(
+    session_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> list[TimelineEvent]:
+    """
+    Read-only causal timeline for one session (v0.19): messages,
+    confirmation parks/resolutions, action states, reissues, and the
+    lease — merged in timestamp order. Safe metadata only: never tool
+    arguments, result bodies, message content, or raw owner tokens.
+    """
+    _enforce_rate_limit(request)
+    if not runtime.session_exists(session_id):
+        raise HTTPException(status_code=404, detail="Unknown session_id.")
+    events = runtime.store.get_session_timeline(session_id, limit=limit)
+    return [TimelineEvent(**e) for e in events]
+
+
+# ── v0.20: personal knowledge base (documents are untrusted data) ────────────
+
+
+def _knowledge_service(runtime: JarvisRuntime):
+    """KnowledgeService over the runtime's own stores (isolated in tests)."""
+    from jarvis.memory.knowledge import KnowledgeService
+
+    return KnowledgeService(store=runtime.store)
+
+
+@app.get("/knowledge/documents", response_model=list[KnowledgeDocumentInfo])
+def list_knowledge_documents(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> list[KnowledgeDocumentInfo]:
+    """Read-only knowledge index listing (safe metadata, bounded)."""
+    _enforce_rate_limit(request)
+    return [
+        KnowledgeDocumentInfo(**d)
+        for d in _knowledge_service(runtime).list_documents(limit=limit)
+    ]
+
+
+@app.get("/knowledge/documents/{document_id}", response_model=KnowledgeDocumentInfo)
+def get_knowledge_document(
+    document_id: str,
+    request: Request,
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> KnowledgeDocumentInfo:
+    """One document's safe metadata (404 unknown)."""
+    _enforce_rate_limit(request)
+    doc = _knowledge_service(runtime).inspect_document(document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Unknown document_id.")
+    return KnowledgeDocumentInfo(**doc)
+
+
+@app.post("/knowledge/ingest", response_model=KnowledgeIngestResponse)
+def ingest_knowledge_document(
+    payload: KnowledgeIngestRequest,
+    request: Request,
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> KnowledgeIngestResponse:
+    """
+    Explicitly ingest ONE document (mutating; authenticated).
+
+    Path safety is enforced server-side: the resolved path must be inside
+    the allowed directory, credential-like files are refused, and no
+    crawling ever happens. Unknown/unsupported/oversized files → 400 with
+    the reason; a duplicate unchanged file returns ``unchanged`` without
+    re-embedding.
+    """
+    _enforce_rate_limit(request)
+    report = _knowledge_service(runtime).ingest(
+        payload.path,
+        target_chars=payload.target_chars,
+        overlap_chars=payload.overlap_chars,
+    )
+    if report.get("status") == "error":
+        raise HTTPException(status_code=400, detail=str(report.get("reason")))
+    log.info(
+        "knowledge_api_ingest",
+        status=report.get("status"),
+        document_id=report.get("document_id"),
+    )
+    return KnowledgeIngestResponse(**report)
+
+
+@app.post("/knowledge/search", response_model=KnowledgeSearchResponse)
+def search_knowledge_endpoint(
+    payload: KnowledgeSearchRequest,
+    request: Request,
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> KnowledgeSearchResponse:
+    """Read-only bounded retrieval with citation-ready metadata."""
+    _enforce_rate_limit(request)
+    report = _knowledge_service(runtime).search(
+        payload.query,
+        top_k=payload.top_k,
+        source=payload.source,
+        document_id=payload.document_id,
+    )
+    return KnowledgeSearchResponse(
+        results=[KnowledgeSearchResult(**r) for r in report["results"]],
+        total_chunks=report["total_chunks"],
+    )
+
+
+@app.delete("/knowledge/documents/{document_id}", response_model=KnowledgeRemoveResponse)
+def delete_knowledge_document(
+    document_id: str,
+    request: Request,
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> KnowledgeRemoveResponse:
+    """Explicitly remove a document (mutating; authenticated; 404 unknown)."""
+    _enforce_rate_limit(request)
+    svc = _knowledge_service(runtime)
+    if svc.inspect_document(document_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown document_id.")
+    report = svc.remove_document(document_id)
+    log.info(
+        "knowledge_api_remove",
+        document_id=document_id,
+        chunks=report["chunks_removed"],
+    )
+    return KnowledgeRemoveResponse(**report)

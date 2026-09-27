@@ -1,7 +1,7 @@
 [project]
 name = "jarvis"
-version = "0.17.0"
-description = "A local, modular AI assistant powered by Ollama — JARVIS v0.16 (production readiness: verified sandbox boundary, live model validation, sharper evaluation signal)"
+version = "0.20.0"
+description = "A local, modular AI assistant powered by Ollama — JARVIS v0.20 (personal knowledge + RAG: document ingestion, grounded retrieval with citations, injection-resistant evidence framing)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -34,6 +34,7 @@ dependencies = [
     # Service layer (v0.9) — REST API over the shared agent runtime
     "fastapi>=0.110.0",
     "uvicorn>=0.29.0",
+    "pypdf>=6.19.0",
 ]
 
 [project.optional-dependencies]
