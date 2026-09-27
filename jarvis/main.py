@@ -34,26 +34,8 @@ from rich.text import Text
 
 from jarvis import __version__
 from jarvis.config import settings
-from jarvis.core.orchestrator import Orchestrator
-from jarvis.core.permissions import PermissionGuard
-from jarvis.memory.session_store import SessionStore
-from jarvis.memory.vector_store import get_vector_store
-from jarvis.tools import (
-    CalculatorTool,
-    CodeExecutionTool,
-    ComputerControlTool,
-    GetCurrentDatetimeTool,
-    ListDirectoryTool,
-    ReadFileTool,
-    RecallFactsTool,
-    RememberFactTool,
-    ToolRegistry,
-    VisionAnalyzeTool,
-    WebScrapeTool,
-    WebSearchTool,
-    WikipediaSummaryTool,
-    WriteFileTool,
-)
+from jarvis.runtime import JarvisRuntime, build_runtime
+from jarvis.tools.registry import ToolRegistry
 from jarvis.utils.logging import get_logger, setup_logging
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
@@ -73,36 +55,7 @@ _TOOL_BLURBS = {
     "write_file": "Write or append to a file",
     "vision_analyze": "Analyze an image using Vision LLM",
     "web_scrape": "Deep scrape a webpage via Playwright",
-    "execute_python_code": "Execute Python in a secure sandbox",
-    "computer_control": "Control mouse and keyboard (Requires Approval)",
 }
-
-
-def _build_orchestrator() -> tuple[Orchestrator, SessionStore, ToolRegistry]:
-    """Assemble all components and return orchestrator, store, and registry."""
-    store = SessionStore()
-
-    # Warm the long-term memory singleton (creates local Chroma path if needed).
-    get_vector_store()
-
-    registry = ToolRegistry()
-    registry.register(GetCurrentDatetimeTool())
-    registry.register(WebSearchTool())
-    registry.register(WikipediaSummaryTool())
-    registry.register(ReadFileTool())
-    registry.register(ListDirectoryTool())
-    registry.register(CalculatorTool())
-    registry.register(RememberFactTool())
-    registry.register(RecallFactsTool())
-    registry.register(WriteFileTool())
-    registry.register(VisionAnalyzeTool())
-    registry.register(WebScrapeTool())
-    registry.register(CodeExecutionTool())
-    registry.register(ComputerControlTool())
-
-    guard = PermissionGuard()
-    orchestrator = Orchestrator(store, registry, guard)
-    return orchestrator, store, registry
 
 
 def _short_session_id(session_id: str) -> str:
@@ -270,14 +223,9 @@ def _start_voice_mode(orchestrator: Orchestrator, session_id: str) -> None:
         console.print("\n[dim]Returned to text mode.[/dim]\n")
 
 
-def _chat_loop(
-    orchestrator: Orchestrator,
-    store: SessionStore,
-    registry: ToolRegistry,
-) -> None:
+def _chat_loop(runtime: JarvisRuntime) -> None:
     """The main read-eval-print loop."""
-    session_id = store.create_session()
-    get_vector_store().set_session(session_id)
+    session_id = runtime.start_session()
     _print_session_banner(session_id)
 
     while True:
@@ -299,20 +247,19 @@ def _chat_loop(
             continue
 
         if command == "/tools":
-            _print_tools(registry)
+            _print_tools(runtime.registry)
             continue
 
         if command == "/history":
-            _print_history(store, session_id)
+            _print_history(runtime.store, session_id)
             continue
 
         if command == "/voice":
-            _start_voice_mode(orchestrator, session_id)
+            _start_voice_mode(runtime.orchestrator, session_id)
             continue
 
         if command == "/new":
-            session_id = store.create_session()
-            get_vector_store().set_session(session_id)
+            session_id = runtime.start_session()
             console.print()
             _print_session_banner(session_id, fresh=True)
             continue
@@ -320,7 +267,7 @@ def _chat_loop(
         if command == "/confirm" or command == "/deny":
             with console.status("[cyan]Processing...[/cyan]", spinner="dots"):
                 try:
-                    response = orchestrator.handle_confirmation(session_id, command == "/confirm")
+                    response = runtime.handle_confirmation(session_id, command == "/confirm")
                 except Exception as e:
                     console.print(f"\n[red]Error:[/red] {e}")
                     continue
@@ -336,7 +283,7 @@ def _chat_loop(
 
         with console.status("[cyan]Thinking…[/cyan]", spinner="dots"):
             try:
-                response = orchestrator.chat(session_id, user_input)
+                response = runtime.chat(session_id, user_input)
             except Exception as e:
                 log.error("orchestrator_error", error=str(e))
                 console.print(f"\n[red]Error:[/red] {e}")
@@ -375,23 +322,22 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
     try:
-        orchestrator, store, registry = _build_orchestrator()
+        runtime = build_runtime()
     except Exception as e:
         console.print(f"[red]Startup error:[/red] {e}")
         sys.exit(1)
 
-    _print_welcome(len(registry))
+    _print_welcome(len(runtime.registry))
 
     try:
         if args.voice:
-            session_id = store.create_session()
-            get_vector_store().set_session(session_id)
+            session_id = runtime.start_session()
             _print_session_banner(session_id)
-            _start_voice_mode(orchestrator, session_id)
+            _start_voice_mode(runtime.orchestrator, session_id)
         else:
-            _chat_loop(orchestrator, store, registry)
+            _chat_loop(runtime)
     finally:
-        store.close()
+        runtime.close()
 
 
 if __name__ == "__main__":

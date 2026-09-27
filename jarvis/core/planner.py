@@ -20,12 +20,29 @@ from jarvis.utils.logging import get_logger
 log = get_logger(__name__)
 
 PLANNER_SYSTEM_PROMPT = (
-    "You are a strategic planner. Break down the user's request into a numbered "
-    "list of actionable, discrete steps. Return ONLY a valid JSON array of objects, "
-    "where each object has 'step_number' (int), 'description' (str), and "
-    "'required_tools' (list of str). Do not include markdown formatting or any "
-    "text outside the JSON array."
+    "You are a strategic planner for a tool-using assistant.\n"
+    "Break the user's request into a numbered list of actionable, discrete steps.\n\n"
+    "Rules:\n"
+    "1. Prefer the FEWEST steps that fully cover the request (1-3 is typical; "
+    "   never invent busywork steps like 'understand' or 'synthesize').\n"
+    "2. Each step must be independently executable and build toward the final answer.\n"
+    "3. 'required_tools' must contain ONLY tool names that exist in the provided "
+    "   tool list; use [] for a pure-reasoning step.\n"
+    "4. Steps that do not depend on earlier results are fine to list in any order; "
+    "   the executor runs them sequentially and the executor, not you, decides "
+    "   the concrete tool arguments.\n"
+    "5. If the request mentions memory of the user ('my', 'remember', personal "
+    "   facts), include the recall_facts / remember_fact tools as required.\n"
+    "6. Resolve references to earlier results ('it', 'that page', 'the result') "
+    "   into each step's own description: every step must be self-contained, "
+    "   because the executor sees prior results but re-reads each description cold.\n"
+    "7. Return ONLY a valid JSON array of objects, where each object has "
+    "   'step_number' (int), 'description' (str), and 'required_tools' (list of str). "
+    "   No markdown fences, no prose outside the JSON array."
 )
+
+# Cap on plan size to bound cost of the execute phase.
+MAX_PLAN_STEPS = 5
 
 # Type alias: matches jarvis.llm.client.chat_completion
 LLMClient = Callable[..., Any]
@@ -39,8 +56,9 @@ class Planner:
         llm_client: Callable with the same signature as ``chat_completion``.
     """
 
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client: LLMClient, tool_names: list[str] | None = None) -> None:
         self._llm = llm_client
+        self._tool_names = list(tool_names) if tool_names else []
 
     def generate_plan(self, user_input: str, context: str) -> list[dict[str, Any]]:
         """
@@ -59,9 +77,8 @@ class Planner:
             {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": (
-                    f"Context:\n{context or '(none)'}\n\n"
-                    f"User request:\n{user_input}"
+                "content": build_planner_user_prompt(
+                    user_input, context, self._tool_names
                 ),
             },
         ]
@@ -78,6 +95,16 @@ class Planner:
             return self._fallback_plan(user_input)
 
         plan = self._parse_plan(raw, user_input=user_input)
+        if len(plan) > MAX_PLAN_STEPS:
+            log.warning(
+                "plan_truncated_to_max_steps",
+                requested=len(plan),
+                max_steps=MAX_PLAN_STEPS,
+            )
+            plan = plan[:MAX_PLAN_STEPS]
+            # Renumber so step numbers stay contiguous.
+            for i, step in enumerate(plan, start=1):
+                step["step_number"] = i
         log.info("plan_generated", steps=len(plan))
         return plan
 
@@ -112,6 +139,19 @@ class Planner:
 
         if not normalised:
             return self._fallback_plan(user_input)
+
+        # LLMs hallucinate tool names (execute_python_code, list_files, ...).
+        # A step whose required_tools do not exist would send the executor
+        # into guaranteed tool errors, so filter them against the real
+        # registry surface when it is known. (Empty tool_names = planner used
+        # standalone without registry info; keep plans untouched there.)
+        known = set(self._tool_names)
+        if known:
+            for step in normalised:
+                step["required_tools"] = [
+                    t for t in step["required_tools"] if t in known
+                ]
+
         return normalised
 
     @staticmethod
@@ -123,6 +163,26 @@ class Planner:
             "description": user_input,
             "required_tools": [],
         }]
+
+
+def build_planner_user_prompt(
+    user_input: str,
+    context: str,
+    tool_names: list[str] | None = None,
+) -> str:
+    """
+    Compose the planner's user message, optionally grounding it in the
+    actual registered tool names so 'required_tools' stays truthful.
+    """
+    tool_block = ""
+    if tool_names:
+        tool_block = "Available tools:\n" + "\n".join(f"- {t}" for t in tool_names) + "\n\n"
+    return (
+        f"Context:\n{context or '(none)'}\n\n"
+        f"{tool_block}"
+        f"User request:\n{user_input}\n\n"
+        "Return a JSON array of plan steps now."
+    )
 
 
 def _strip_code_fences(text: str) -> str:

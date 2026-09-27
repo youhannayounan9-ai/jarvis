@@ -1,163 +1,76 @@
 """
 jarvis/tools/code_execution.py
 ──────────────────────────────
-Tool: execute_python_code
+Tool: execute_python_code — gated, defense-in-depth code execution.
 
-Executes Python code in a restricted sandbox namespace.
+Registration model (see jarvis/runtime.py):
+  - Not registered unless explicitly enabled via config (ENABLE_CODE_EXECUTION)
+    AND a verified-isolation sandbox is available.
+  -computer_control remains disabled unconditionally.
+
+Layered gates before any code runs:
+  1. Registry:      the tool is absent from the active surface by default.
+  2. Sandbox gate:  only a sandbox whose ``provides_isolation`` is True may
+                    execute — and it must ALSO prove availability at
+                    construction (an unreachable Docker daemon degrades the
+                    sandbox to DisabledSandbox, never to host execution).
+  3. Sandbox:       DockerCodeSandbox re-validates everything per run and
+                    fails closed on any uncertainty.
 """
 
-import builtins
-import io
-import math
-import random
-import threading
-from datetime import datetime
-from typing import Any, Dict
+from typing import Any
 
+from jarvis.core.sandbox import CodeSandbox, DisabledSandbox
 from jarvis.tools.base import BaseTool
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-# Allowed builtins for the restricted sandbox
-ALLOWED_BUILTINS = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "ascii": ascii,
-    "bin": bin,
-    "bool": bool,
-    "bytearray": bytearray,
-    "bytes": bytes,
-    "callable": callable,
-    "chr": chr,
-    "complex": complex,
-    "dict": dict,
-    "dir": dir,
-    "divmod": divmod,
-    "enumerate": enumerate,
-    "filter": filter,
-    "float": float,
-    "format": format,
-    "frozenset": frozenset,
-    "getattr": getattr,
-    "hasattr": hasattr,
-    "hash": hash,
-    "hex": hex,
-    "id": id,
-    "int": int,
-    "isinstance": isinstance,
-    "issubclass": issubclass,
-    "iter": iter,
-    "len": len,
-    "list": list,
-    "map": map,
-    "max": max,
-    "min": min,
-    "next": next,
-    "object": object,
-    "oct": oct,
-    "ord": ord,
-    "pow": pow,
-    "print": print,
-    "property": property,
-    "range": range,
-    "repr": repr,
-    "reversed": reversed,
-    "round": round,
-    "set": set,
-    "setattr": setattr,
-    "slice": slice,
-    "sorted": sorted,
-    "str": str,
-    "sum": sum,
-    "super": super,
-    "tuple": tuple,
-    "type": type,
-    "zip": zip,
-}
-
-
-def _run_with_timeout(func, timeout_sec: float) -> tuple[Any, Exception | None]:
-    result = None
-    exception = None
-
-    def worker():
-        nonlocal result, exception
-        try:
-            result = func()
-        except Exception as e:
-            exception = e
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(timeout_sec)
-    
-    if t.is_alive():
-        return None, TimeoutError(f"Execution timed out after {timeout_sec}s.")
-    return result, exception
-
 
 class CodeExecutionTool(BaseTool):
     name = "execute_python_code"
     description = (
-        "CRITICAL: Use this to execute Python code in a safe sandbox. "
-        "Only for calculation and data processing. Do not import unsafe modules."
+        "Execute Python code in an isolated, resource-limited container "
+        "(no network, read-only filesystem). Disabled unless verified "
+        "container isolation is available."
     )
     parameters = {
         "type": "object",
         "properties": {
             "code": {
                 "type": "string",
-                "description": "The Python code to execute. Standard output (print) is captured.",
+                "description": "The Python code to execute.",
             },
         },
         "required": ["code"],
     }
     risk_level = "SYSTEM"
-    timeout_seconds = 10.0
+    timeout_seconds = 5.0
+
+    def __init__(self, sandbox: CodeSandbox | None = None):
+        super().__init__()
+        if (
+            sandbox is not None
+            and getattr(sandbox, "provides_isolation", False)
+            and hasattr(sandbox, "is_available")
+            and not sandbox.is_available()
+        ):
+            # An isolation-asserting sandbox that cannot actually run (no
+            # docker, daemon down, image missing) must degrade to the disabled
+            # sandbox — never to host execution. Fail closed.
+            log.error(
+                "isolation_sandbox_unavailable_degrading_to_disabled",
+                sandbox=type(sandbox).__name__,
+            )
+            sandbox = DisabledSandbox()
+        self.sandbox = sandbox or DisabledSandbox()
 
     def run(self, code: str, **kwargs: Any) -> str:
-        log.info("code_execution_start", length=len(code))
-        
-        # Static check for blatantly unsafe words
-        unsafe_keywords = ["__import__", "eval", "exec", "open", "os.", "sys.", "subprocess."]
-        for k in unsafe_keywords:
-            if k in code:
-                return f"ERROR: Security violation. Use of '{k}' is forbidden."
-
-        output_buffer = io.StringIO()
-        
-        # Prepare execution environment
-        def safe_print(*args, **kw):
-            kw["file"] = output_buffer
-            print(*args, **kw)
-        
-        safe_builtins = dict(ALLOWED_BUILTINS)
-        safe_builtins["print"] = safe_print
-        
-        namespace: Dict[str, Any] = {
-            "__builtins__": safe_builtins,
-            "math": math,
-            "random": random,
-            "datetime": datetime,
-        }
-
-        def execute():
-            # exec operates in the provided namespace
-            exec(code, namespace)
-
-        _, exc = _run_with_timeout(execute, timeout_sec=5.0)
-
-        if exc:
-            if isinstance(exc, (NameError, AttributeError, ImportError)):
-                log.error("code_execution_security_violation", error=str(exc))
-                return "ERROR: Security violation: Restricted function or module blocked."
-            log.error("code_execution_failed", error=str(exc))
-            if isinstance(exc, TimeoutError):
-                return f"ERROR: {exc}"
-            return f"ERROR: Exception during execution:\n{exc}"
-
-        captured = output_buffer.getvalue()
-        log.info("code_execution_success", output_length=len(captured))
-        return captured or "(Execution finished with no output)"
+        log.warning("code_execution_attempted", sandbox=type(self.sandbox).__name__)
+        if not getattr(self.sandbox, "provides_isolation", False):
+            return (
+                "ERROR: Code execution is currently disabled because the current "
+                "implementation is not an isolated sandbox."
+            )
+        # Live path: only a verified, available, isolated sandbox reaches here.
+        return self.sandbox.execute_code(code, timeout_seconds=self.timeout_seconds)

@@ -2,34 +2,67 @@
 
 > A **Local-first, privacy-oriented, and free of paid model APIs by default** AI assistant — powered by Ollama. No cloud.
 
-**JARVIS v0.8.0** — a **modular agentic AI prototype with production-oriented architecture**. It is a text-based CLI assistant with tool calling, persistent conversation history, Web UI Dashboard, Vision, Browser Automation, Computer Automation, Safe Code Execution, Advanced Permissions, and a clean modular architecture designed for progressive expansion.
+**JARVIS v0.16.0** — a **local-first agentic AI assistant with a closed reliability loop**. One agent runtime (Plan-and-Execute loop, 11+ tools, permission tiers, *resumable* durable confirmations, context management, self-correction) behind a hardened **REST API (FastAPI)**: auth, rate limiting, per-session serialization, request-ID correlation, deep health checks, truly interleaved SSE streaming — deployed via docker-compose with WAL-backed persistence, a **runtime-verified** workload-timeout-enforced sandbox, and CI with a documented trust boundary. The 32-case evaluation harness runs against a real Ollama model with per-case timeouts, category breakdowns, per-failure details, regression comparison (`--compare`), and JSON reports. Computer control remains structurally disabled.
 
 ---
 
-## ✨ What's New in v0.8.0
+## ✨ What's New in v0.16.0
 
-- 🖱️ **Computer Automation** — `computer_control` tool to automate mouse and keyboard actions safely via PyAutoGUI.
-- 🐍 **Safe Code Execution** — `execute_python_code` tool providing a **restricted Python execution environment (OS-level isolation planned)** to process data and math.
-- 🔐 **Advanced Permission System** — Confirmation flow for high-risk tools via CLI (`/confirm`, `/deny`) and the Web UI.
-- ⚡ **Performance Optimization** — Session store LRU caching and `web_search` TTL caching via `cachetools`.
+- 🐳 **Sandbox base image digest genuinely pinned** — the `python:3.12-slim` digest in `deploy/Dockerfile.sandbox` was resolved by an actual `docker pull` against a Linux daemon and the production image built from it (previously a fail-closed placeholder). CI now really builds and smoke-runs the sandbox image.
+- 🔬 **Real-Docker integration suite** — `tests/test_sandbox_integration.py` drives a real Linux engine and asserts *observed* behavior from inside containers: non-root uid, dropped capabilities, read-only rootfs, noexec tmpfs, no network, bounded PIDs, memory-cap kills, workload-killing timeouts (exit 124, no orphans), and the layer-C force-removal mechanism. Skips cleanly (with a reason) when Linux Docker is unavailable; a skip is never a pass.
+- 🤖 **Live-model evaluation actually run** — the full 32-case suite executed against a real `qwen2.5:7b` via Ollama 0.34.1: **23/32 passed (71.9%), zero timeouts** on the final run (20/32 before the harness/grader fixes — the regression diff is exactly what `--compare` now reports). Failures were classified (agent defects vs grader gaps vs model variance); the real defects were fixed: an absent-tool fabrication hole in the system prompt (model silently computed `print(2+2)` instead of refusing) and an eval-harness mock that masked unregistered-tool calls.
+- 📊 **Sharper evaluation signal** — machine-readable reports upgraded (schema v2: per-case content digest, expected-vs-actual tool detail, failure reasons/details, durations); `--compare PRIOR_JSON` regression diffing (newly failing / newly passing / unchanged, rename-surviving via content digests); the context-budget check now measures the prompt-side window it always claimed to check. Grader semantics audited; lexical-≠-semantic limitation documented.
+- ⏱️ **Honest timeout semantics** — the per-case eval timeout is documented as a thread-join abandonment (the in-flight model call is NOT terminated); the code-execution sandbox remains the real workload terminator (exit 124, force-removal — both now observed against a live daemon).
+- Full verification details: [`deploy/README.md`](deploy/README.md) and [`docs/architecture.md` § Verification status](docs/architecture.md).
+
+## ✨ What's New in v0.15.0
+
+- ⏱️ **Sandbox timeout enforced at the workload boundary** — the container entrypoint is `timeout <cap>s python3 …`, so a runaway snippet is killed *inside* the container (exit 124), not merely abandoned by the host. If the host-side wait times out first (hung CLI/daemon), the container is force-removed (`docker rm -f`). `ExecutionResult.timeout_layer` reports which layer fired: `container`, `host_kill`, or none. All isolation flags unchanged.
+- 🔁 **Confirmation approval now resumes the original task** — approving a high-risk action executes it, persists the result, restores the paused plan from SQLite, executes the remaining steps, and synthesizes a final answer. Works after a process restart. Denials also continue the task (minus the denied action). Expired/legacy/corrupt pause states degrade safely.
+- 🛡️ **CI trust boundary documented and enforced** — workflow `permissions: contents: read`, nightly eval job schedule-only with no persisted credentials, `CODEOWNERS` on workflows/deploy/container files; runner requirements (dedicated machine, unprivileged account, no docker.sock) written down in `deploy/README.md`.
+- Full details of the resume architecture: [`docs/architecture.md`](docs/architecture.md).
+
+## ✨ What's New in v0.14.0
+
+- 🔬 **Live-model eval harness** — `evaluation/run_evals.py` is now practical: Ollama pre-flight, per-case timeouts (a runaway generation can't wedge the run), `--filter`/`--category` selection, category pass-rate breakdown, failure summaries, and `--json` machine-readable reports for trend tracking.
+- 🤖 **Nightly CI evals** — scheduled job on self-hosted Ollama runners (non-blocking, report uploaded as an artifact).
+- 🌊 **True SSE interleaving** — `/chat/stream` now runs the turn in a worker thread and streams lifecycle events *as they happen*, with 15-second keepalive comments so proxies don't close idle connections during long generations.
+- 🧠 **Planner tool filtering** — hallucinated `required_tools` names are filtered against the real registry before execution (fully-hallucinated steps degrade to safe reasoning steps).
+- 📏 **Strict-grounding prompt rules** — explicit anti-fabrication policy (say what's missing instead of guessing; never compute silently when a tool exists) and referent-echo rule for multi-turn answers.
+- ⏱️ **Turn durations in logs** — `response_ready` now carries `duration_ms` for both the fast and complex paths; removed a duplicate schema-serialization call per complex request.
+- 🧹 **Test dedup completed** — all fakes now come from `tests/fakes.py`.
+
+- 🚦 **API rate limiting** — in-process sliding window (default 60 req/60s, `RATE_LIMIT_*` envs, `0` disables), keyed by API key or client IP; over-limit → `429` + `Retry-After`; `/health` exempt.
+- 🔒 **Per-session serialization** — concurrent turns on one session now return `409 Conflict` instead of interleaving history or double-resolving confirmations; different sessions stay fully parallel.
+- 🖥️ **API-first dashboard** — the Streamlit UI consumes the REST API via a new stdlib-only client (`jarvis/api/client.py`); with `JARVIS_API_URL` set it can run on a different machine than the agent runtime (legacy in-process mode still available).
+- 📦 **Dedicated sandbox image** — `deploy/Dockerfile.sandbox`: minimal interpreter-only image with a dedicated unprivileged user; mutable tags (`latest`, bare names) now rejected by the sandbox validator — pin tags or digests. Full build/pin/pre-pull guide in `deploy/README.md`.
+- 👁️ **Observability** — structured per-request logs (`api_request`), `tool_calls` lifecycle events in the SSE stream and `on_event` seam.
+- 🧪 **Eval harness at 26 cases** — adds tool-failure honesty, three-turn context chains across topic detours, and comparative multi-source synthesis.
+
+- 🐳 **Real Docker-isolated code execution** — one-shot containers with `--network none`, read-only rootfs, `--cap-drop ALL`, `no-new-privileges`, non-root user, memory/CPU/PID ceilings, and read-only code mounts. Off by default (`ENABLE_CODE_EXECUTION=false`); the tool joins the LLM's surface only when the config flag is set **and** Docker is verified usable. Fail-closed on every uncertain step.
+- 🔑 **API authentication (opt-in)** — set `JARVIS_API_KEY` to require `Authorization: Bearer <key>` (or `X-API-Key`) on every endpoint except `/health`. Constant-time comparison.
+- 🌊 **SSE streaming chat** — `POST /chat/stream` emits the agent's lifecycle (`intent` → `plan` → `step_start`/`step_done` → `synthesis` → `done`) as server-sent events, with in-band errors.
+- 👁️ **Observability seam** — `Orchestrator.chat(..., on_event=...)` exposes the same lifecycle events the stream emits; observer failures can never break execution.
+- 🧱 **Stability fixes** — context-window floor (a zero-length window can no longer return the entire history), session-history cache invalidated inside the store lock (no stale reads for concurrent API workers), plus regression tests for concurrency and edge cases.
+- ⚠️ **Honest capability claims** — see [Current Limitations](#current-limitations).
 
 ---
 
 ## Features
 
-- 💬 **Conversational AI** — full session memory backed by SQLite
-- 🛠️ **Tool calling** — LLM can autonomously call tools to answer questions
+- 💬 **Conversational AI** — full session memory backed by SQLite (thread-safe)
+- 🛠️ **Tool calling** — Plan-and-Execute loop with a fast path for simple intents; concurrent dispatch within a tool round
+- 🐍 **Code execution (opt-in)** — Docker-isolated one-shot containers; off unless explicitly enabled and verified (see [Safe Code Execution](#safe-code-execution-docker))
 - 🔍 **Web search & Scraping** — DuckDuckGo and Playwright browser integration for **dynamic web browsing and extraction**
 - 👁️ **Vision** — Image understanding via Llava
 - 🕐 **Current time/date** — instant, no network
-- 📄 **Read/Write files** — sandboxed to your project directory
+- 📄 **Read files** — sandboxed to your allowed directory (see [Current Limitations](#current-limitations) for writes)
+- 🧠 **Long-term memory** — `remember_fact` / `recall_facts` backed by ChromaDB
+- 🧩 **Context management** — windowing, task anchoring, rolling summary, tool-output clamping
+- 🛡️ **Permission tiers & durable confirmations** — high-risk actions require explicit approval, persisted across restarts
 - 🔒 **Fully local** — your data never leaves your machine, providing **local inference without remote API network latency**
-- 🏗️ **Modular** — adding a new tool takes ~30 lines
-- 🌐 **Web UI** — Streamlit-based interface with thought process observability
-
----
-
-## Prerequisites
+- 🌐 **REST API** — FastAPI service layer with optional API-key auth and SSE streaming
+- 🏗️ **Modular** — adding a new tool takes ~30 lines and one registration line
 
 ### 1. Python 3.11+
 
@@ -110,6 +143,31 @@ unless you want to change the model or sandbox directory.
 
 ## Running JARVIS
 
+### Docker (recommended for a service)
+
+```bash
+cp .env.example .env          # set JARVIS_API_KEY at minimum
+# external Ollama on the host:
+OLLAMA_BASE_URL=http://host.docker.internal:11434 docker compose up -d api
+
+# or fully self-contained (includes Ollama):
+docker compose --profile local-llm up -d
+docker compose exec ollama ollama pull qwen2.5:7b
+
+curl http://localhost:8000/health
+```
+
+The `jarvis-data` volume persists `jarvis.db` and the vector store across restarts. Scheduled maintenance runs against the same volume:
+
+```bash
+docker compose run --rm api python -m jarvis.maintenance stats
+docker compose run --rm api python -m jarvis.maintenance cleanup --days 30
+```
+
+See [`deploy/README.md`](deploy/README.md) for the sandbox image build and the full hardening checklist.
+
+### Local CLI
+
 Make sure Ollama is running in the background:
 
 ```bash
@@ -136,13 +194,92 @@ jarvis --voice
 
 Or from the text REPL: type `/voice`.
 
+### REST API server (v0.10)
+
+Start the FastAPI service (same runtime as the CLI):
+
+```bash
+uv run uvicorn jarvis.api.app:app --port 8000
+```
+
+Quick tour:
+
+```bash
+# Health & introspection (version, model, tools, auth + sandbox posture)
+curl http://localhost:8000/health
+
+# Start a session
+curl -X POST http://localhost:8000/sessions
+# → {"session_id": "..."}
+
+# Chat
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "<id>", "message": "What time is it?"}'
+
+# Stream one turn as SSE events (intent → plan → steps → done)
+curl -N -X POST http://localhost:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "<id>", "message": "Research X and summarize it"}'
+
+# Inspect history / resolve pending confirmations
+curl http://localhost:8000/sessions/<id>/history
+curl http://localhost:8000/sessions/<id>/confirm
+curl -X POST http://localhost:8000/sessions/<id>/confirm \
+  -H "Content-Type: application/json" -d '{"confirmed": true}'
+```
+
+Interactive OpenAPI docs are served at `http://localhost:8000/docs`.
+
+### API authentication (opt-in)
+
+By default the API trusts localhost. To require a key, set it in `.env` (or the environment):
+
+```env
+JARVIS_API_KEY=change-me-to-a-long-random-value
+```
+
+Every endpoint except `/health`, `/docs`, and `/openapi.json` then requires:
+
+```bash
+curl -H "Authorization: Bearer $JARVIS_API_KEY" ...      # preferred
+curl -H "X-API-Key: $JARVIS_API_KEY" ...                 # alternative
+```
+
+Keys are compared in constant time; failed attempts log the client and return `401` with `WWW-Authenticate: Bearer`.
+
+### Safe Code Execution (Docker)
+
+Code execution ships **off**. To enable it:
+
+```env
+ENABLE_CODE_EXECUTION=true
+SANDBOX_IMAGE=ubuntu:24.04          # tag-pinned; 'latest'/bare names are REJECTED
+```
+
+Production should build the dedicated minimal image instead (no shell tooling, no package managers, dedicated unprivileged user, **digest-pinned and pull-verified base**) — see [`deploy/README.md`](deploy/README.md):
+
+```bash
+docker build -t jarvis-sandbox:1.0.0 -f deploy/Dockerfile.sandbox deploy/
+docker images --digests jarvis-sandbox   # then pin: SANDBOX_IMAGE=jarvis-sandbox:1.0.0@sha256:<digest>
+```
+
+The tool registers **only if** Docker verifies usable at startup (CLI + daemon + image present). Each execution runs in a one-shot container with: no network (`--network none`), a read-only root filesystem, all Linux capabilities dropped, `no-new-privileges`, a non-root user, hard memory/CPU/PID ceilings, and the code mounted read-only. Time limits are enforced **inside the container** (`timeout` wrapper, exit 124) with a host-side wait as backup and force-removal if the host wait fires first. Any failure mode is a *denial* — never host execution. Windows hosts are refused (use WSL2/Linux); the sandbox never pulls images at runtime.
+
+> The code-execution tool is `SYSTEM` risk: even when enabled, a call parks a durable confirmation that must be approved (`/confirm` in the CLI, `POST /sessions/{id}/confirm` in the API) before the container runs.
+
 ## Security & Safety
 
 JARVIS employs a strict permission model to ensure your machine stays secure.
+- **Structurally absent tools:** `computer_control` is never registered — a pure placeholder with no OS automation code. `execute_python_code` registers only behind the double gate described above.
 - **Sandboxed File Reading:** `read_file` is strictly limited to paths relative to `FILE_READER_ALLOWED_DIR`.
-- **Restricted Code Execution:** `execute_python_code` disables destructive builtins (`__import__`, `eval`, `exec`, `open`, etc) and enforces a 5-second timeout.
-- **High Risk Action Confirmation:** Operations tagged as `SYSTEM` or `DESTRUCTIVE` (like `computer_control` or `write_file` depending on configuration) require explicit user confirmation.
-- **No Network Egress for Code:** The python sandbox has no access to sockets or urllib.
+- **Permission tiers:** `SAFE`/`NETWORK`/`FILE_READ` run automatically; `SYSTEM`/`DESTRUCTIVE` require explicit, durable user confirmation (`/confirm` in CLI, `POST /sessions/{id}/confirm` in the API, buttons in the dashboard); `FILE_WRITE` is currently blocked outright.
+- **Hardened containers, not promises:** when code execution is enabled, every run is one-shot, network-less, capability-less, non-root, read-only-rootfs, and resource-capped. Failures deny — they never fall back to host execution.
+- **No in-process `exec()`/`eval()`** on model-influenced strings — the v0.7-era in-process sandbox was removed. The calculator uses a restricted AST walker.
+- **Bounded autonomy:** tool rounds are capped per request (5) and per step (2), with a self-correction sub-loop capped at 2 recovery attempts.
+- **Optional API auth:** constant-time API-key enforcement whenever `JARVIS_API_KEY` is set.
+
+Details: [`docs/architecture.md` § Safety Model](docs/architecture.md).
 
 ---
 
@@ -160,7 +297,21 @@ streamlit run ui/dashboard.py
 
 JARVIS can listen with **Whisper** (local STT) and speak with **Edge TTS** (free neural voices).
 
-### Prerequisites
+### Current Limitations
+
+JARVIS advertises only what actually works today:
+
+- **Code execution is opt-in and platform-gated** — disabled unless `ENABLE_CODE_EXECUTION=true` **and** Docker verifies usable; unavailable on Windows hosts (use WSL2/Linux), and the image must be pulled in advance. See [Safe Code Execution](#safe-code-execution-docker).
+- **Computer control is disabled** — the tool is a pure placeholder with no OS automation code.
+- **File writes are blocked** — `write_file` is registered but the permission guard blocks `FILE_WRITE` risk tier; only reads are permitted.
+- **Voice TTS needs internet** — recognition is local (Whisper); speech output streams from Microsoft's free Edge TTS endpoint.
+- **Auth is opt-in** — without `JARVIS_API_KEY` the API trusts localhost; set a key before exposing it beyond loopback.
+- **Deterministic summaries** — context compaction is rule-based (no extra LLM call, zero cost, but less fluent than an LLM summary).
+- **Lexical, not semantic, evaluation** — the 32 graders are deterministic string checks: great as a regression tripwire, but they do not prove semantic correctness (no LLM judge). See [`deploy/README.md` §7](deploy/README.md).
+
+---
+
+## Prerequisites
 
 1. **ffmpeg** (required by Whisper)
 
@@ -237,6 +388,10 @@ MAX_TOKENS=2048
 FILE_READER_ALLOWED_DIR=.      # Sandbox for read_file tool
 LOG_LEVEL=INFO                 # DEBUG | INFO | WARNING | ERROR
 
+# Context management
+MAX_CONTEXT_MESSAGES=24        # LLM-facing window size (older turns are summarized)
+MAX_TOOL_OUTPUT_CHARS=6000     # Per-message cap for tool results (head + tail kept)
+
 # Voice (v0.4)
 WHISPER_MODEL=base
 TTS_VOICE=en-US-GuyNeural
@@ -260,25 +415,37 @@ Tests run fully offline — no Ollama or network required.
 ```
 JARVIS/
 ├── jarvis/
-│   ├── main.py            ← CLI entry point + component wiring
-│   ├── config.py          ← All config, loaded from .env
+│   ├── runtime.py          ← Assembly seam: build_runtime() + JarvisRuntime
+│   ├── main.py             ← CLI entry point (thin over the runtime)
+│   ├── api/                ← FastAPI service layer (app.py, schemas.py)
+│   ├── config.py           ← All config, loaded from .env
 │   ├── core/
-│   │   ├── orchestrator.py  ← ReAct tool-calling loop
-│   │   └── permissions.py   ← Permission guard (stub in v0.1)
+│   │   ├── orchestrator.py ← Route → Plan → Execute → Synthesize
+│   │   ├── planner.py      ← JSON plan generation with fallback
+│   │   ├── permissions.py  ← Risk tiers + confirmation policy
+│   │   └── sandbox.py      ← CodeSandbox ABC + fail-closed implementations
 │   ├── llm/
-│   │   └── client.py      ← LiteLLM → Ollama wrapper
+│   │   └── client.py       ← LiteLLM → Ollama wrapper
 │   ├── memory/
-│   │   └── session_store.py ← SQLite conversation history
+│   │   ├── session_store.py   ← SQLite sessions/messages/confirmations (thread-safe)
+│   │   ├── context_manager.py ← Windowing, anchoring, summarization, clamping
+│   │   └── vector_store.py    ← ChromaDB long-term memory
 │   ├── tools/
-│   │   ├── base.py        ← Abstract tool interface
+│   │   ├── base.py        ← Abstract tool interface + risk levels
 │   │   ├── registry.py    ← Tool registry + dispatcher
 │   │   ├── datetime_tool.py
 │   │   ├── web_search.py
-│   │   └── file_reader.py
+│   │   └── …
 │   └── utils/
 │       └── logging.py     ← structlog setup
+├── evaluation/             ← Offline eval harnesses
 ├── tests/
-├── docs/architecture.md
+├── docs/
+│   ├── architecture.md     ← Layers, lifecycle, safety model
+│   ├── JARVIS_USER_MANUAL.md     ← Owner's guide: capabilities, startup, troubleshooting
+│   ├── JARVIS_DEVELOPER_MANUAL.md ← Architecture, internals, extension guides
+│   └── PROJECT_OVERVIEW.md ← Handoff overview
+├── ui/dashboard.py         ← Streamlit dashboard
 ├── .env.example
 ├── pyproject.toml
 └── README.md
@@ -288,8 +455,8 @@ JARVIS/
 
 ## Adding a New Tool
 
-See [`docs/architecture.md`](docs/architecture.md) for the full checklist.
-In short: create a file in `jarvis/tools/`, subclass `BaseTool`, register it in `main.py`.
+See [`docs/architecture.md` § Adding a New Tool](docs/architecture.md) for the full checklist.
+In short: create a file in `jarvis/tools/`, subclass `BaseTool`, and add it to `_TOOL_FACTORIES` in `jarvis/runtime.py` — the single registration point that CLI, API, and dashboard all share.
 
 ---
 
@@ -303,7 +470,14 @@ In short: create a file in `jarvis/tools/`, subclass `BaseTool`, register it in 
 | **v0.4** | ✅ Voice input (Whisper) + voice output (Edge TTS) |
 | **v0.5** | ✅ Web UI (Streamlit) + write_file tool + synthesis polish |
 | **v0.6** | ✅ Vision (image understanding) + Playwright web scrape |
-| **v0.8** | ✅ Computer automation, Code Sandbox, Advanced Permissions, Caching |
+| **v0.8** | ✅ Permission tiers, durable confirmations, caching, context management |
+| **v0.9** | ✅ Service architecture: JarvisRuntime seam, FastAPI REST API, thread-safe store, sandbox contract |
+| **v0.10** | ✅ Real Docker-isolated code execution (opt-in), API auth, SSE streaming, observability seam, stability fixes |
+| **v0.11** | ✅ Deploy-ready service: rate limiting, per-session serialization, dedicated sandbox image, API-first dashboard |
+| **v0.12** | ✅ Ship path: docker-compose, service image, CI, request IDs, maintenance CLI, dispatch dedup |
+| **v0.13** | ✅ Operate: deep health (503 on broken persistence), error sanitization + correlation, WAL persistence, `doctor` command |
+| **v0.14** | ✅ Live-model quality loop: practical eval harness, nightly CI evals, true SSE interleaving, planner grounding |
+| **v0.15** | ✅ Reliability & security closure: workload-boundary sandbox timeout, resumable confirmations, CI trust hardening |
 
 ---
 
@@ -312,7 +486,14 @@ In short: create a file in `jarvis/tools/`, subclass `BaseTool`, register it in 
 - **LiteLLM / Ollama Error:** Ensure Ollama is running in the background (`ollama serve`). If you're missing a model, run `ollama pull <model-name>`.
 - **Playwright errors:** Ensure the chromium binaries are installed via `playwright install chromium`.
 - **Voice errors:** Ensure `ffmpeg` is on your system `PATH`.
-- **PyAutoGUI failsafe:** If mouse automation goes out of control, quickly move your physical mouse to any of the 4 corners of your primary screen to trigger the failsafe.
+- **API returns 503 on `/chat`:** Ollama is unreachable from the server process; check `ollama serve` and `OLLAMA_BASE_URL`.
+- **API returns 401:** `JARVIS_API_KEY` is set and your request is missing/has a wrong key; send `Authorization: Bearer <key>`.
+- **API returns 409 on `/chat`:** another turn is already running on that session; wait for it to finish (or use a different session).
+- **Chat response is `ACTION_REQUIRES_CONFIRMATION…`:** the turn is *paused*, not finished — approve/deny via `/confirm`/`/deny` (CLI) or `POST /sessions/{id}/confirm` (API) and the original task continues automatically, including after a restart.
+- **API returns 429:** you hit the rate limit (`RATE_LIMIT_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS`); honor the `Retry-After` header.
+- **API returns 503 on `/health`:** the DB read/write probe failed — check volume mount and disk; `python -m jarvis.maintenance doctor` localizes it.
+- **`/chat` returns a generic 503:** the real cause is in the server log under the response's `X-Request-ID` (also echoed in the JSON body as `request_id`); `python -m jarvis.maintenance doctor` checks Ollama reachability.
+- **Code execution stays disabled:** with `ENABLE_CODE_EXECUTION=true` the tool still requires usable Docker (CLI, daemon, image pulled). Check the startup log for `code_execution_enabled_but_docker_unavailable`. Not supported on Windows hosts — use WSL2 or Linux. Also check `SANDBOX_IMAGE` is not `latest`/bare — mutable tags are rejected.
 
 
 ## License

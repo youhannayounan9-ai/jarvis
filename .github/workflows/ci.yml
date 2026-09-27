@@ -1,0 +1,97 @@
+# CI: tests + image builds.
+#
+# Trust model (v0.15 — the repository is PUBLIC):
+#   - push/PR jobs run on GitHub-EPHEMERAL runners only. Untrusted PR code
+#     never touches a self-hosted machine.
+#   - The live-model eval job runs on a SELF-HOSTED runner and is
+#     SCHEDULE-ONLY: it executes whatever is on main at 03:00 UTC — never
+#     pull-request workflow code. See deploy/README.md § CI trust boundary
+#     for runner requirements (dedicated, unprivileged, no docker.sock).
+#   - Workflow changes require Code Owner review (CODEOWNERS) in addition to
+#     branch protection on main.
+name: ci
+
+# Least privilege by default; jobs elevate explicitly if ever needed.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *"  # nightly: live-model eval job only
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Run test suite (offline)
+        env:
+          DB_PATH: ":memory:"
+          VECTOR_DB_PATH: ${{ runner.temp }}/jarvis-chroma
+        run: uv run pytest -q
+
+  api-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build JARVIS API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: jarvis-api:ci
+
+  sandbox-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dedicated sandbox image (requires pinned base digest)
+        run: |
+          if grep -q "REPLACE_WITH_VERIFIED_DIGEST" deploy/Dockerfile.sandbox; then
+            echo "::warning::Sandbox base digest not yet pinned; skipping build."
+            echo "Verify python:3.12-slim for your arch and edit deploy/Dockerfile.sandbox."
+            exit 0
+          fi
+          docker build -t jarvis-sandbox:ci -f deploy/Dockerfile.sandbox deploy/
+          # Smoke: interpreter must run without network.
+          docker run --rm --network none jarvis-sandbox:ci python3 --version
+
+  # Nightly live-model signal: NOT a merge gate. Schedule-ONLY on a
+  # self-hosted runner (never pull_request/push → never executes PR code).
+  # Runner requirements: dedicated machine, unprivileged service account,
+  # NO docker socket mounted. See deploy/README.md § CI trust boundary.
+  nightly-evals:
+    if: github.event_name == 'schedule'
+    runs-on: [self-hosted, ollama]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Run live-model evaluation harness
+        run: |
+          uv run python evaluation/run_evals.py --json eval-report.json
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.run_id }}
+          path: eval-report.json
+          retention-days: 90

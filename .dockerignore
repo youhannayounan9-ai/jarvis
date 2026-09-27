@@ -1,0 +1,30 @@
+# Local state and environments — never baked into the image.
+.git
+.venv
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local data (mounted as volumes instead).
+*.db
+*.db-journal
+jarvis_data/
+chroma*/
+
+# Deploy artifacts built separately.
+deploy/*.tar
+deploy/context/
+
+# UI/voice assets not needed for the API image stay, but local junk goes:
+.env
+.env.*
+!.env.example
+
+# Editor noise.
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -20,6 +20,8 @@ import json
 import time
 from typing import Any
 
+from pydantic import ValidationError
+
 from jarvis.tools.base import BaseTool
 from jarvis.utils.logging import get_logger
 
@@ -108,13 +110,29 @@ class ToolRegistry:
             return error
 
         try:
-            args: dict[str, Any] = json.loads(tool_args_json) if tool_args_json else {}
+            raw_args: dict[str, Any] = json.loads(tool_args_json) if tool_args_json else {}
         except json.JSONDecodeError as e:
             error = f"ERROR: Could not parse tool arguments as JSON: {e}"
             log.error("tool_args_parse_error", tool=tool_name, error=str(e))
             return error
 
         tool = self._tools[tool_name]
+        
+        # ── Runtime Validation Boundary ─────────────────────────────────────────
+        try:
+            validated_model = tool._args_model.model_validate(raw_args)
+            args = validated_model.model_dump(exclude_unset=True)
+        except ValidationError as e:
+            error_lines = [f"ERROR: Invalid arguments for '{tool_name}':"]
+            for err in e.errors():
+                loc = ".".join(str(loc) for loc in err["loc"])
+                msg = err["msg"]
+                error_lines.append(f"  - {loc}: {msg}")
+            
+            error_str = "\n".join(error_lines)
+            log.error("tool_args_validation_error", tool=tool_name, error=error_str)
+            return error_str
+        
         timeout = float(tool.timeout_seconds)
 
         log.info(
@@ -136,6 +154,85 @@ class ToolRegistry:
             return result
 
         except concurrent.futures.TimeoutError:
+            elapsed = time.monotonic() - started
+            error = (
+                f"ERROR: Tool '{tool_name}' execution timed out "
+                f"after {timeout} seconds."
+            )
+            log.error(
+                "tool_timeout",
+                tool=tool_name,
+                timeout_seconds=timeout,
+                elapsed_seconds=round(elapsed, 3),
+            )
+            return error
+
+        except Exception as e:
+            elapsed = time.monotonic() - started
+            error = f"ERROR: Tool '{tool_name}' raised an unexpected exception: {e}"
+            log.error(
+                "tool_exception",
+                tool=tool_name,
+                error=str(e),
+                elapsed_seconds=round(elapsed, 3),
+            )
+            return error
+
+    async def dispatch_async(self, tool_name: str, tool_args_json: str) -> str:
+        """
+        Asynchronously execute a tool by name with JSON-encoded arguments.
+        
+        This calls `tool.run_async()`, which natively supports async IO or 
+        automatically offloads to a thread if not implemented.
+        """
+        import asyncio
+        if tool_name not in self._tools:
+            error = f"ERROR: Unknown tool '{tool_name}'. Available: {list(self._tools)}"
+            log.warning("tool_not_found", tool=tool_name)
+            return error
+
+        try:
+            raw_args: dict[str, Any] = json.loads(tool_args_json) if tool_args_json else {}
+        except json.JSONDecodeError as e:
+            error = f"ERROR: Could not parse tool arguments as JSON: {e}"
+            log.error("tool_args_parse_error", tool=tool_name, error=str(e))
+            return error
+
+        tool = self._tools[tool_name]
+        
+        # ── Runtime Validation Boundary ─────────────────────────────────────────
+        try:
+            validated_model = tool._args_model.model_validate(raw_args)
+            args = validated_model.model_dump(exclude_unset=True)
+        except ValidationError as e:
+            error_lines = [f"ERROR: Invalid arguments for '{tool_name}':"]
+            for err in e.errors():
+                loc = ".".join(str(loc) for loc in err["loc"])
+                msg = err["msg"]
+                error_lines.append(f"  - {loc}: {msg}")
+            
+            error_str = "\n".join(error_lines)
+            log.error("tool_args_validation_error", tool=tool_name, error=error_str)
+            return error_str
+        
+        timeout = float(tool.timeout_seconds)
+
+        log.info(
+            "tool_dispatching_async",
+            tool=tool_name,
+            args=args,
+            risk_level=tool.risk_level,
+            timeout_seconds=timeout,
+        )
+
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(tool.run_async(**args), timeout=timeout)
+            elapsed = time.monotonic() - started
+            log.info("tool_success_async", tool=tool_name, elapsed_seconds=round(elapsed, 3))
+            return result
+
+        except asyncio.TimeoutError:
             elapsed = time.monotonic() - started
             error = (
                 f"ERROR: Tool '{tool_name}' execution timed out "

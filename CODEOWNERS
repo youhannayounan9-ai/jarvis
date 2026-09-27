@@ -1,0 +1,23 @@
+# CODEOWNERS — protection for security-relevant surfaces.
+#
+# The repository is PUBLIC. GitHub treats a CODEOWNERS entry as a required
+# reviewer when branch protection enables "Require review from Code Owners"
+# (Settings → Branches → main; documented in deploy/README.md § CI trust
+# boundary).
+#
+# Trust rule in force (v0.15): the nightly live-model evaluation job runs on
+# a SELF-HOSTED runner and is schedule-only. It must never execute
+# pull-request workflow code. These ownership rules keep any change that
+# could alter that boundary (workflows, sandbox image, deployment surface)
+# behind explicit owner review.
+
+# Workflow files can change what executes on runners — always owner-reviewed.
+/.github/workflows/ @youhannayounan9-ai
+
+# The sandbox image and build path define the code-execution security boundary.
+/deploy/ @youhannayounan9-ai
+
+# The container/deployment surface.
+/Dockerfile @youhannayounan9-ai
+/docker-compose.yml @youhannayounan9-ai
+/.dockerignore @youhannayounan9-ai

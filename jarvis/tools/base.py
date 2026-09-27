@@ -20,7 +20,9 @@ Tool result contract:
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Literal
+from typing import Any, Literal, Type
+
+from pydantic import BaseModel, create_model, Field, ValidationError
 
 # Risk tiers used by PermissionGuard to decide allow / block / confirm.
 RiskLevel = Literal[
@@ -45,6 +47,9 @@ class BaseTool(ABC):
     description: str  # What this tool does — shown to the LLM
     parameters: dict[str, Any]  # JSON Schema for the tool's input arguments
 
+    # Automatically generated during __init_subclass__
+    _args_model: Type[BaseModel]
+
     # Security / reliability — subclasses SHOULD override risk_level to match
     # their side effects. timeout_seconds may be raised for slow network tools.
     risk_level: RiskLevel = "SAFE"
@@ -68,6 +73,12 @@ class BaseTool(ABC):
                 f"got {timeout!r}"
             )
 
+        # Generate Pydantic validation model from JSON schema
+        if hasattr(cls, "parameters") and isinstance(cls.parameters, dict):
+            cls._args_model = _build_pydantic_model(cls.name, cls.parameters)
+        else:
+            cls._args_model = create_model(f"{cls.__name__}Args")
+
     @abstractmethod
     def run(self, **kwargs: Any) -> str:
         """
@@ -80,6 +91,17 @@ class BaseTool(ABC):
             A string result to be returned to the LLM.
             On error, return a descriptive "ERROR: ..." string — do not raise.
         """
+
+    async def run_async(self, **kwargs: Any) -> str:
+        """
+        Asynchronous execution of the tool.
+
+        By default, this offloads the synchronous `run` method to a thread
+        so it doesn't block the event loop. Subclasses can override this
+        for native async IO.
+        """
+        import asyncio
+        return await asyncio.to_thread(self.run, **kwargs)
 
     def to_openai_schema(self) -> dict[str, Any]:
         """
@@ -102,3 +124,49 @@ class BaseTool(ABC):
             f"risk_level={self.risk_level!r} "
             f"timeout_seconds={self.timeout_seconds}>"
         )
+
+
+def _build_pydantic_model(tool_name: str, schema: dict[str, Any]) -> Type[BaseModel]:
+    """Dynamically build a Pydantic model from a simple JSON schema."""
+    properties = schema.get("properties", {})
+    required_fields = set(schema.get("required", []))
+    
+    fields: dict[str, Any] = {}
+    for field_name, field_info in properties.items():
+        type_str = field_info.get("type", "string")
+        
+        # Map JSON schema types to Python types
+        if type_str == "string":
+            py_type = str
+        elif type_str == "integer":
+            py_type = int
+        elif type_str == "number":
+            py_type = float
+        elif type_str == "boolean":
+            py_type = bool
+        elif type_str == "array":
+            py_type = list
+        elif type_str == "object":
+            py_type = dict
+        else:
+            py_type = Any
+            
+        # Handle enums
+        if "enum" in field_info:
+            enum_values = field_info["enum"]
+            if enum_values:
+                # Use Literal for typing
+                py_type = Literal[tuple(enum_values)]  # type: ignore
+
+        description = field_info.get("description", "")
+        
+        if field_name in required_fields:
+            fields[field_name] = (py_type, Field(..., description=description))
+        else:
+            fields[field_name] = (py_type, Field(default=None, description=description))
+            
+    from pydantic import ConfigDict
+    config = ConfigDict(extra="forbid")
+
+    model_name = f"{"".join(word.capitalize() for word in tool_name.split('_'))}Args"
+    return create_model(model_name, __config__=config, **fields)

@@ -329,6 +329,55 @@ class TestToolRegistry:
         assert len(schemas) == 1
         assert schemas[0]["type"] == "function"
 
+    def test_dispatch_validation_missing_required(self):
+        from jarvis.tools.web_search import WebSearchTool
+        self.registry.register(WebSearchTool())
+        # WebSearchTool requires 'query'
+        result = self.registry.dispatch("web_search", "{}")
+        assert "ERROR: Invalid arguments for 'web_search'" in result
+        assert "query" in result
+        assert "Field required" in result or "required" in result
+
+    def test_dispatch_validation_wrong_type(self):
+        from jarvis.tools.web_search import WebSearchTool
+        if "web_search" not in self.registry._tools:
+            self.registry.register(WebSearchTool())
+        # max_results should be an integer, but we pass an object
+        result = self.registry.dispatch("web_search", '{"query": "test", "max_results": {}}')
+        assert "ERROR: Invalid arguments" in result
+        assert "max_results" in result
+
+    def test_dispatch_validation_extra_args_forbidden(self):
+        from jarvis.tools.web_search import WebSearchTool
+        if "web_search" not in self.registry._tools:
+            self.registry.register(WebSearchTool())
+        result = self.registry.dispatch("web_search", '{"query": "test", "hallucinated_arg": "bad"}')
+        assert "ERROR: Invalid arguments" in result
+        assert "hallucinated_arg" in result
+        assert "Extra inputs are not permitted" in result or "extra" in result.lower()
+
+    def test_dispatch_validation_success_with_optional(self):
+        from jarvis.tools.web_search import WebSearchTool
+        if "web_search" not in self.registry._tools:
+            self.registry.register(WebSearchTool())
+        
+        with patch("jarvis.tools.web_search.WebSearchTool.run", return_value="success") as mock_run:
+            result = self.registry.dispatch("web_search", '{"query": "test"}')
+            assert result == "success"
+            mock_run.assert_called_once_with(query="test")
+
+    def test_dispatch_validation_coercion(self):
+        from jarvis.tools.web_search import WebSearchTool
+        if "web_search" not in self.registry._tools:
+            self.registry.register(WebSearchTool())
+        
+        with patch("jarvis.tools.web_search.WebSearchTool.run", return_value="success") as mock_run:
+            # max_results is an integer field, but we pass a string "5"
+            result = self.registry.dispatch("web_search", '{"query": "test", "max_results": "5"}')
+            assert result == "success"
+            # verify it was passed as the integer 5
+            mock_run.assert_called_once_with(query="test", max_results=5)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # vision_analyze (mocked — no network or large models)
@@ -407,26 +456,33 @@ class TestComputerControlTool:
     def test_name(self):
         assert self.tool.name == "computer_control"
 
-    @patch("pyautogui.moveTo")
-    @patch("time.sleep")
-    def test_move_mouse(self, mock_sleep, mock_moveTo):
+    def test_move_mouse_disabled(self):
         result = self.tool.run(action="move_mouse", x=100, y=200)
-        assert "Successfully executed action: move_mouse" in result
-        mock_moveTo.assert_called_with(100, 200, duration=0.5)
+        assert "Computer control is currently disabled" in result
 
-    @patch("pyautogui.write")
-    @patch("time.sleep")
-    def test_type_text(self, mock_sleep, mock_write):
+    def test_type_text_disabled(self):
         result = self.tool.run(action="type_text", text="hello")
-        assert "Successfully executed action: type_text" in result
-        mock_write.assert_called_with("hello", interval=0.01)
+        assert "Computer control is currently disabled" in result
 
-    @patch("pyautogui.moveTo")
-    @patch("time.sleep")
-    @patch("jarvis.tools.computer_control.log.info")
-    def test_failsafe_logging(self, mock_log_info, mock_sleep, mock_moveTo):
-        self.tool.run(action="move_mouse", x=100, y=200)
-        mock_log_info.assert_any_call("computer_control_executing", action="move_mouse", params={'x': 100, 'y': 200})
+    def test_click_disabled(self):
+        result = self.tool.run(action="click", x=50, y=50)
+        assert "Computer control is currently disabled" in result
+
+    def test_press_key_disabled(self):
+        result = self.tool.run(action="press_key", key="enter")
+        assert "Computer control is currently disabled" in result
+
+    def test_scroll_disabled(self):
+        result = self.tool.run(action="scroll", amount=3)
+        assert "Computer control is currently disabled" in result
+
+    def test_not_registered_in_main(self):
+        """The standard runtime surface must NOT include computer_control."""
+        from unittest.mock import patch as _patch
+        with _patch("jarvis.runtime.get_vector_store"):
+            from jarvis.runtime import build_runtime
+            runtime = build_runtime()
+        assert "computer_control" not in runtime.registry.list_tools()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -443,17 +499,88 @@ class TestCodeExecutionTool:
 
     def test_basic_execution(self):
         result = self.tool.run(code="print(2 + 2)")
-        assert "4" in result
+        assert "Code execution is currently disabled" in result
 
     def test_security_violation(self):
         result = self.tool.run(code="import os")
-        assert "ERROR: Security violation" in result
+        assert "Code execution is currently disabled" in result
 
     def test_execution_timeout(self):
-        # A simple infinite loop that will time out
         result = self.tool.run(code="while True: pass")
+        assert "Code execution is currently disabled" in result
+
+    def test_not_registered_in_main(self):
+        """The standard runtime surface must NOT include execute_python_code."""
+        from unittest.mock import patch as _patch
+        with _patch("jarvis.runtime.get_vector_store"):
+            from jarvis.runtime import build_runtime
+            runtime = build_runtime()
+        assert "execute_python_code" not in runtime.registry.list_tools()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# write_file (sandboxed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWriteFileTool:
+    def setup_method(self):
+        from jarvis.tools.write_file import WriteFileTool
+        self.tool = WriteFileTool()
+
+    def test_name(self):
+        assert self.tool.name == "write_file"
+
+    def test_risk_level(self):
+        assert self.tool.risk_level == "FILE_WRITE"
+
+    def test_writes_file_inside_sandbox(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FILE_READER_ALLOWED_DIR", str(tmp_path))
+        import importlib, jarvis.config, jarvis.tools.write_file
+        importlib.reload(jarvis.config)
+        importlib.reload(jarvis.tools.write_file)
+        from jarvis.tools.write_file import WriteFileTool as FreshTool
+        tool = FreshTool()
+        result = tool.run(file_path=str(tmp_path / "out.txt"), content="hello")
+        assert "Successfully wrote" in result
+        assert (tmp_path / "out.txt").read_text() == "hello"
+
+    def test_append_mode(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FILE_READER_ALLOWED_DIR", str(tmp_path))
+        import importlib, jarvis.config, jarvis.tools.write_file
+        importlib.reload(jarvis.config)
+        importlib.reload(jarvis.tools.write_file)
+        from jarvis.tools.write_file import WriteFileTool as FreshTool
+        tool = FreshTool()
+        target = tmp_path / "log.txt"
+        target.write_text("line1\n")
+        tool.run(file_path=str(target), content="line2\n", append=True)
+        assert target.read_text() == "line1\nline2\n"
+
+    def test_blocks_path_traversal(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FILE_READER_ALLOWED_DIR", str(tmp_path))
+        import importlib, jarvis.config, jarvis.tools.write_file
+        importlib.reload(jarvis.config)
+        importlib.reload(jarvis.tools.write_file)
+        from jarvis.tools.write_file import WriteFileTool as FreshTool
+        tool = FreshTool()
+        result = tool.run(
+            file_path=str(tmp_path / "../../etc/crontab"),
+            content="evil"
+        )
         assert "ERROR" in result
-        assert "timed out" in result or "Exception" in result
+        assert "Access denied" in result
+
+    def test_blocks_absolute_path_outside_sandbox(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FILE_READER_ALLOWED_DIR", str(tmp_path))
+        import importlib, jarvis.config, jarvis.tools.write_file
+        importlib.reload(jarvis.config)
+        importlib.reload(jarvis.tools.write_file)
+        from jarvis.tools.write_file import WriteFileTool as FreshTool
+        tool = FreshTool()
+        # Attempt to overwrite a system-adjacent file
+        result = tool.run(file_path="C:\\Windows\\evil.txt", content="evil")
+        assert "ERROR" in result
+        assert "Access denied" in result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -474,24 +601,21 @@ class TestPermissionConfirmationFlow:
         orchestrator = Orchestrator(store, registry, guard)
         
         # Inject a pending confirmation
-        orchestrator._pending_confirmations["test_session"] = {
+        pending_data = {
             "tool_name": "dummy",
             "tool_args": "{}",
             "tool_call_id": "call_123",
             "risk_level": "SYSTEM"
         }
+        store.complete_pending_confirmation.return_value = pending_data
         
         # Deny
         res_deny = orchestrator.handle_confirmation("test_session", False)
         assert "denied" in res_deny.lower()
         
         # Confirm (since dummy isn't in registry, it'll error from registry, but that proves it tried to dispatch)
-        orchestrator._pending_confirmations["test_session"] = {
-            "tool_name": "dummy",
-            "tool_args": "{}",
-            "tool_call_id": "call_124",
-            "risk_level": "SYSTEM"
-        }
+        pending_data["tool_call_id"] = "call_124"
+        store.complete_pending_confirmation.return_value = pending_data
         res_confirm = orchestrator.handle_confirmation("test_session", True)
         assert "Unknown tool" in res_confirm or "Executed" in res_confirm
 

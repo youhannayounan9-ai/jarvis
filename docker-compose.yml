@@ -1,0 +1,125 @@
+# docker-compose.yml — JARVIS service deployment (v0.12)
+#
+#   Services:
+#     api      — the JARVIS FastAPI service (the agent runtime)
+#     ollama   — optional local LLM server (profile: "local-llm")
+#
+#   Sandbox: code-execution containers are launched BY the api service via
+#   the host docker CLI/socket. Build the dedicated sandbox image first:
+#       ./deploy/build-sandbox-image.sh
+#   ...and set SANDBOX_IMAGE in .env to the pinned ref it prints.
+#
+#   Quick start (external Ollama on the host):
+#     cp .env.example .env         # set JARVIS_API_KEY at minimum
+#     docker compose up -d api
+#     curl http://localhost:8000/health
+#
+#   Fully self-contained (includes Ollama):
+#     docker compose --profile local-llm up -d
+#     docker compose exec ollama ollama pull qwen2.5:7b
+#
+#   Maintenance (session cleanup / stats) — run on the same volume:
+#     docker compose run --rm api python -m jarvis.maintenance stats
+#     docker compose run --rm api python -m jarvis.maintenance cleanup --days 30
+#
+#   Pre-flight / triage (DB write, Ollama reachability, sandbox posture):
+#     docker compose exec api python -m jarvis.maintenance doctor
+
+name: jarvis
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jarvis-api:0.12.0
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # Rotated logs keep a long-running container from filling the host disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # In-flight chat turns (minutes on local LLMs) finish before SIGKILL.
+    stop_grace_period: 90s
+    environment:
+      # Security
+      JARVIS_API_KEY: ${JARVIS_API_KEY:-}
+      # Code-execution sandbox: OFF unless explicitly enabled AND the image
+      # below exists locally on the api container's docker context.
+      ENABLE_CODE_EXECUTION: ${ENABLE_CODE_EXECUTION:-false}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-jarvis-sandbox:1.0.0}
+      # LLM backend
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      # Persistence (matches Dockerfile ENV; volume-mounted below)
+      DB_PATH: /data/jarvis.db
+      VECTOR_DB_PATH: /data/chroma_db
+      # Protection
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-60}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+    volumes:
+      - jarvis-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    # ── Optional: enable Docker-backed code execution ────────────────────────
+    # The api container must reach a docker daemon to launch one-shot sandbox
+    # containers. Uncomment on a LINUX host only; keep ENABLE_CODE_EXECUTION
+    # in .env false unless you accept the socket exposure:
+    #   volumes:
+    #     - /var/run/docker.sock:/var/run/docker.sock
+    #     - ./deploy/Dockerfile.sandbox:/app/deploy/Dockerfile.sandbox:ro
+    # The sandbox image itself must be pre-built and pre-pulled on the daemon
+    # the api container talks to (the sandbox never pulls at runtime).
+    depends_on:
+      ollama:
+        condition: service_healthy
+        required: false
+    networks:
+      - jarvis-net
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ollama-models:/root/.ollama
+    # GPU users: uncomment for NVIDIA containers-toolkit installs.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    networks:
+      - jarvis-net
+
+volumes:
+  jarvis-data:
+  ollama-models:
+
+networks:
+  jarvis-net:
+    driver: bridge

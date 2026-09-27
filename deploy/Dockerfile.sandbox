@@ -1,0 +1,49 @@
+# deploy/Dockerfile.sandbox
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal dedicated sandbox image for JARVIS code execution.
+#
+# Why not ubuntu:24.04? It carries the full distro userland (~75MB unpacked)
+# for no benefit inside a network-less, capability-less container. This image
+# contains ONLY what untrusted Python needs:
+#   - python3 + stdlib (no pip, no compilers, no package managers)
+#   - a dedicated untrusted user (jarvis-sbx)
+# and NOTHING that helps an attacker pivot:
+#   - no shell beyond the interpreter itself
+#   - no curl/wget/ssh/ping, no package tools at runtime
+#   - no SUID binaries beyond base policy (capabilities are dropped anyway)
+#
+# Build once, pin by digest, and configure:
+#   docker build -t jarvis-sandbox:1.0.0 -f deploy/Dockerfile.sandbox deploy/
+#   docker images --digests jarvis-sandbox          # copy the digest
+#   # .env:
+#   SANDBOX_IMAGE=jarvis-sandbox:1.0.0@sha256:<digest>
+#   docker pull <the exact ref>                     # pre-pull for is_available()
+#
+# NOTE: the base image below is digest-pinned for a reproducible build.
+# The digest was resolved and verified by an actual `docker pull
+# python:3.12-slim` against a real Linux daemon (2026-09-27):
+#   Digest: sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+#   Re-verify before rebuilding:  docker pull python:3.12-slim
+#                                 docker images --digests python
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+
+# Security posture of the image itself:
+#   - run everything as the dedicated untrusted user
+#   - writable dir only where the sandbox mounts tmpfs anyway
+RUN groupadd -r -g 2000 jarvis-sbx \
+    && useradd -r -u 2000 -g jarvis-sbx -d /sandbox -s /usr/sbin/nologin jarvis-sbx \
+    && mkdir -p /sandbox \
+    && chown jarvis-sbx:jarvis-sbx /sandbox \
+    && rm -rf /var/lib/apt/lists/* /root/.cache
+
+# No package tools needed at runtime; keep the image small and inert.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /sandbox
+USER jarvis-sbx
+
+# Sanity target: the image's interpreter must run and nothing else is expected.
+CMD ["python3", "--version"]

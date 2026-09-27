@@ -19,7 +19,9 @@ class WriteFileTool(BaseTool):
     name = "write_file"
     description = (
         "CRITICAL: Use this to write or append text to a file. "
-        "You MUST provide a valid filename and content."
+        "You MUST provide a valid filename and content. "
+        "If you do not call this tool, the file is NOT written and you must "
+        "never claim to have written, saved, or deleted it."
     )
     parameters = {
         "type": "object",

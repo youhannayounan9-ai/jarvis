@@ -1,0 +1,257 @@
+# deploy/README.md — Service Deployment Guide (v0.16)
+
+How to run JARVIS as a real service: sandbox image, API hardening, and the
+runtime/interface split. Security posture first: **everything fails closed.**
+
+---
+
+## 1. The sandbox image
+
+JARVIS code execution runs untrusted Python in one-shot containers. The
+default fallback image is a tag-pinned distro image; production deployments
+should build the dedicated minimal image instead.
+
+### Why a dedicated image
+
+`deploy/Dockerfile.sandbox` contains only what untrusted Python needs —
+the interpreter, the stdlib, and a dedicated unprivileged user
+(`jarvis-sbx`, uid/gid 2000). Compared to a distro image it removes the
+attack surface and the weight: no shell-only tooling of value, no
+curl/wget/ssh, no package managers, ~75MB → ~50MB, faster cold starts.
+
+### Build, pin, pre-pull
+
+```bash
+# 1. Verify and pin the base image digest for your architecture first
+#    (edit deploy/Dockerfile.sandbox FROM line), then:
+docker build -t jarvis-sandbox:1.0.0 -f deploy/Dockerfile.sandbox deploy/
+
+# 2. Pin by digest so the runtime boundary is immutable:
+docker images --digests jarvis-sandbox
+#   .env:  SANDBOX_IMAGE=jarvis-sandbox:1.0.0@sha256:<digest>
+
+# 3. Pre-pull on the host that runs JARVIS (the sandbox never pulls at
+#    runtime — a missing image is a denial, not a download):
+docker pull jarvis-sandbox:1.0.0@sha256:<digest>
+```
+
+#### Base digest: verified state and re-verification procedure
+
+**CONFIRMED (2026-09-27, real Linux daemon):** the `python:3.12-slim` base
+digest in `deploy/Dockerfile.sandbox` was resolved and verified by an actual
+`docker pull python:3.12-slim` against a live Linux engine:
+
+```
+sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+```
+
+The digest was then confirmed pullable *by ref*
+(`docker pull python:3.12-slim@sha256:f77ac9e4…`) and the production image
+was built from it. To re-verify after a future base update (or on a different
+architecture):
+
+```bash
+docker pull python:3.12-slim
+docker images --digests python          # copy the new digest
+# edit the FROM line in deploy/Dockerfile.sandbox
+# then re-run the integration suite (below) before deploying
+```
+
+If the digest is ever reverted to `REPLACE_WITH_VERIFIED_DIGEST`, the build
+script and CI both fail closed, and the Docker integration tests skip with a
+printed reason.
+
+#### Real-Docker verification suite (v0.16)
+
+`tests/test_sandbox_integration.py` verifies **observed behavior** against a
+real Linux engine — not flag construction: it builds the production image and
+asserts, from inside real containers, the non-root uid, dropped capabilities,
+read-only rootfs, noexec tmpfs, no network, bounded PIDs, memory-cap kills,
+workload-killing timeouts (exit 124, no orphans), the layer-C force-removal
+mechanism, and output caps. Run it wherever a Linux daemon exists:
+
+```bash
+uv run pytest tests/test_sandbox_integration.py -v
+```
+
+Prerequisites are checked first; the whole module **skips cleanly** (never
+fails, never pretends) when the docker CLI, a Linux engine, or the pinned
+digest is unavailable.
+
+The sandbox's image validator enforces this policy mechanically:
+bare names and `latest` are rejected (`latest` can be re-pushed with
+different contents — a mutable security boundary); concrete tags and
+`sha256:` digest refs are accepted.
+
+### Enabling code execution
+
+```env
+ENABLE_CODE_EXECUTION=true
+SANDBOX_IMAGE=jarvis-sandbox:1.0.0@sha256:<digest>
+```
+
+The tool joins the LLM surface only if `is_available()` verifies docker CLI,
+daemon, and the image locally. Every run is still one-shot, network-less,
+read-only-rootfs, capability-less, non-root, and resource-capped — and still
+`SYSTEM` risk, so a durable confirmation is required before execution.
+
+### Timeout enforcement (three distinct layers)
+
+Since v0.15 the time limit is enforced **at the workload boundary** (v0.16
+additionally verified it at runtime — see §1), not only
+at the host:
+
+- **B — container timeout (primary):** the container entrypoint is
+  `timeout <cap>s python3 script.py` (coreutils). The workload is killed
+  *inside* the container (exit 124) — definitive termination.
+- **A — host process timeout (secondary):** the host stops waiting on the
+  docker CLI at cap + 5 s slack. By itself this only stops *waiting* — which
+  is exactly why layer B exists.
+- **C — actual termination:** if layer A fires first (hung CLI/daemon), the
+  container is force-removed (`docker rm -f jarvis-sbx-exec`) so no orphan
+  keeps consuming CPU.
+
+`ExecutionResult.timeout_layer` reports which layer fired (`container`,
+`host_kill`, or None), and `denial_reason="timeout"` on both timeout paths.
+The sandbox never pulls images at runtime and keeps every isolation flag
+listed above.
+
+---
+
+## 2. Running the service
+
+```bash
+uv sync --extra dev
+cp .env.example .env        # set OLLAMA_MODEL, JARVIS_API_KEY, sandbox vars
+
+# API (primary service surface)
+uv run uvicorn jarvis.api.app:app --host 127.0.0.1 --port 8000
+# production: --workers 2+ behind a reverse proxy; set JARVIS_API_KEY
+
+# CLI (same runtime, same surface)
+uv run jarvis
+
+# Dashboard (now an API client, not an in-process runtime)
+uv run streamlit run ui/dashboard.py
+```
+
+### Hardening checklist for exposure beyond loopback
+
+- `JARVIS_API_KEY` set (constant-time enforced on every endpoint but `/health`)
+- reverse proxy (TLS, real rate limiting, request size caps) in front
+- `DB_PATH` on a persistent volume; backups of `jarvis.db`
+- `ENABLE_CODE_EXECUTION` left off unless the host is Linux/WSL2 with the
+  dedicated image pre-pulled
+- computer control remains unconditionally disabled — there is no flag
+
+---
+
+## 3. API protection (in-process)
+
+- **Rate limiting** — sliding-window limiter keyed by API key (or client IP
+  when auth is off). `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` in
+  `.env` (default 60 req / 60 s; `0` disables). Over-limit → `429` with
+  `Retry-After`. `/health` is exempt. In-process only — for multi-replica
+  deployments keep the reverse proxy as the authoritative limiter.
+- **Per-session serialization** — one chat turn per session at a time.
+  Concurrent turns on the same session return `409 Conflict` instead of
+  interleaving history or double-resolving confirmations. Different sessions
+  are fully parallel. **Single-replica only:** the lock is process-local, so
+  run exactly one API container per session domain (the compose file does).
+- **Confirmation continuation (v0.15)** — an approved/denied high-risk action
+  RESUMES the original task: remaining plan steps execute and the final
+  answer is synthesized, even if the service restarted while the action was
+  pending. The pause state lives in SQLite next to the confirmation row.
+- **Auth** — see README (`JARVIS_API_KEY`, Bearer/X-API-Key, constant-time).
+
+---
+
+## 4. Interface / runtime split
+
+`jarvis/api/client.py` is a dependency-free HTTP client over the REST API
+(stdlib `urllib`). The Streamlit dashboard uses it: the UI is now a pure
+client and can run on a different machine than the agent runtime. The CLI
+still embeds the runtime directly (lowest latency for local use) — both
+surfaces share `build_runtime()` semantics through the API contract.
+
+Env for the dashboard:
+
+```env
+JARVIS_API_URL=http://127.0.0.1:8000   # default
+JARVIS_API_KEY=                        # only if the server requires auth
+```
+
+---
+
+## 5. CI trust boundary (public repository — read this before adding a runner)
+
+The GitHub repository is **public**. That makes the CI trust model a
+security control, not an optimization:
+
+- **`push`/`pull_request` jobs run on GitHub-hosted ephemeral runners.**
+  Untrusted pull-request code never reaches your machines. This is the only
+  place PR-triggered code may execute.
+- **The nightly live-model eval job (`nightly-evals`) runs on a self-hosted
+  runner and is SCHEDULE-ONLY** (`if: github.event_name == 'schedule'`). It
+  executes whatever is on `main` at 03:00 UTC — it never runs pull-request
+  workflow code. Never remove that guard.
+- **Self-hosted runner requirements** (all of them, not optional):
+  - A **dedicated machine/VM** that hosts nothing else — a personal
+    workstation is NOT an acceptable runner; it holds your credentials,
+    browser sessions, and files.
+  - An **unprivileged service account**, never your login user.
+  - **No Docker socket mounted** into the runner, and no credential
+    material beyond what the eval needs (a local Ollama endpoint).
+  - Prefer an **ephemeral** runner (re-registered per job) so any compromise
+    does not persist between runs.
+- **Workflow changes are owner-reviewed**: `CODEOWNERS` covers
+  `.github/workflows/`, `deploy/`, and container files. Enable *Require
+  review from Code Owners* on `main` branch protection. Anyone can open a
+  PR in a public repo; your approval of workflow changes is the trust
+  boundary that keeps the runner from executing attacker-chosen code.
+- The workflow runs with `permissions: contents: read` (least privilege);
+  the nightly job additionally checks out with `persist-credentials: false`.
+
+## 6. Operational notes
+
+- `GET /health` reports `auth_enabled`, `code_execution` posture, tool
+  surface, and version — wire your liveness probe to it.
+- Structured logs: every API request logs method/path/status/duration
+  (`api_request`); chat turns log the plan and each step (`plan_ready`,
+  `step_execute_start/done`) — aggregate with any JSON log shipper.
+- `cleanup_old_sessions(max_age_days=30)` exists on the store; schedule it
+  (cron/OS task) — the service does not do background jobs itself.
+
+## 7. Live-model evaluation procedure
+
+The 32-case harness grades the real agent loop against a live Ollama model
+(tool side effects mocked; the permission guard stays real). A case timeout
+is an ABANDONMENT (thread join), not a kill of the model call — budget
+per-case time accordingly (`--timeout`, default 120 s; allow ≥240 s for a
+cold CPU-only model whose first calls include load time).
+
+```bash
+# 0. Preconditions
+ollama serve &                      # or the desktop app
+ollama pull qwen2.5:7b              # settings.ollama_model
+
+# 1. Preflight + inventory (no model calls)
+uv run python evaluation/run_evals.py --list
+
+# 2. Full live run with a machine-readable report
+uv run python evaluation/run_evals.py --timeout 240 --json eval-report.json
+
+# 3. Compare against a prior run (regression diff)
+uv run python evaluation/run_evals.py --timeout 240 \
+    --json eval-report-new.json --compare eval-report.json
+```
+
+Exit codes: `0` all cases passed, `1` failures (details per case incl.
+expected-vs-called tools and grader verdicts), `2` usage error or Ollama
+unreachable (fail-fast, no 32-failure cascade).
+
+**What the numbers prove:** tool-selection and refusal/continuity behavior
+under lexical graders — deterministic, cheap, but NOT semantic correctness.
+There is no LLM judge; a passing response can still be subtly wrong in ways
+the textual patterns miss. Treat the suite as a regression tripwire, not a
+quality guarantee.

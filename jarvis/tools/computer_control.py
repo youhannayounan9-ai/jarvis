@@ -3,10 +3,16 @@ jarvis/tools/computer_control.py
 ────────────────────────────────
 Tool: computer_control
 
-Uses PyAutoGUI to safely execute mouse and keyboard actions.
+PLACEHOLDER — real computer automation is currently disabled.
+
+This module is intentionally kept so the tool class can be imported by
+tests and as a structural placeholder for the future safe implementation
+(e.g., a Docker-isolated or explicitly permission-gated executor).
+
+DO NOT re-enable pyautogui or any desktop-control library here until a
+proper sandboxing / human-approval workflow is in place.
 """
 
-import time
 from typing import Any
 
 from jarvis.tools.base import BaseTool
@@ -14,13 +20,18 @@ from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
 
+_DISABLED_MSG = (
+    "ERROR: Computer control is currently disabled. "
+    "The capability has been turned off because it directly manipulates "
+    "the host machine's mouse and keyboard without a safe, isolated "
+    "execution boundary. It will be re-enabled once a proper approval "
+    "workflow and sandboxing strategy are implemented."
+)
+
 
 class ComputerControlTool(BaseTool):
     name = "computer_control"
-    description = (
-        "CRITICAL: Use this to control the mouse and keyboard. "
-        "Requires explicit action type and parameters."
-    )
+    description = "CRITICAL: This tool is currently disabled. Do not attempt to use it."
     parameters = {
         "type": "object",
         "properties": {
@@ -53,68 +64,8 @@ class ComputerControlTool(BaseTool):
         "required": ["action"],
     }
     risk_level = "SYSTEM"
-    timeout_seconds = 10.0
-
-    def __init__(self):
-        super().__init__()
-        import pyautogui
-        pyautogui.FAILSAFE = True
+    timeout_seconds = 1.0
 
     def run(self, action: str, **kwargs: Any) -> str:
-        try:
-            import pyautogui
-            
-            x = kwargs.get("x")
-            y = kwargs.get("y")
-            text = kwargs.get("text")
-            key = kwargs.get("key")
-            amount = kwargs.get("amount")
-
-            log.info("computer_control_executing", action=action, params=kwargs)
-
-            # Execution logic
-            if action == "move_mouse":
-                if x is None or y is None:
-                    return "ERROR: Missing x or y for move_mouse."
-                pyautogui.moveTo(x, y, duration=0.5)
-            
-            elif action == "click":
-                if x is not None and y is not None:
-                    pyautogui.click(x=x, y=y)
-                else:
-                    pyautogui.click()
-            
-            elif action == "type_text":
-                if not text:
-                    return "ERROR: Missing text for type_text."
-                pyautogui.write(text, interval=0.01)
-            
-            elif action == "press_key":
-                if not key:
-                    return "ERROR: Missing key for press_key."
-                # Handle hotkeys like 'ctrl+c'
-                if "+" in key:
-                    keys = key.split("+")
-                    pyautogui.hotkey(*keys)
-                else:
-                    pyautogui.press(key)
-            
-            elif action == "scroll":
-                if amount is None:
-                    return "ERROR: Missing amount for scroll."
-                pyautogui.scroll(int(amount))
-                
-            else:
-                return f"ERROR: Unknown action {action}."
-            
-            # Safety pause
-            time.sleep(0.5)
-            log.info("computer_control_success", action=action)
-            return f"Successfully executed action: {action}"
-
-        except pyautogui.FailSafeException:
-            log.warning("computer_control_failsafe_triggered", action=action)
-            return "ERROR: Execution aborted by user failsafe."
-        except Exception as e:
-            log.error("computer_control_error", action=action, error=str(e))
-            return f"ERROR: Computer control failed. {e}"
+        log.warning("computer_control_disabled_attempt", action=action)
+        return _DISABLED_MSG

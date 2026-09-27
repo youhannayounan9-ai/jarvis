@@ -19,6 +19,7 @@ Schema:
 
 import json
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
@@ -37,6 +38,9 @@ _VALID_ROLES = {"user", "assistant", "tool", "system"}
 # bulky search/file payloads do not crowd out recent dialogue.
 _MAX_STORED_TOOL_CONTENT = 2000
 
+# How long a pending confirmation is valid before it is considered expired.
+CONFIRMATION_TTL_MINUTES: int = 10
+
 
 class SessionStore:
     """
@@ -52,6 +56,10 @@ class SessionStore:
     def __init__(self) -> None:
         self._conn = _get_connection()
         _init_db(self._conn)
+        # The store is shared across threads once the FastAPI service layer
+        # runs sync endpoints in FastAPI's worker pool. SQLite connections are
+        # single-threaded by default; serialize access explicitly.
+        self._lock = threading.RLock()
         log.info("session_store_ready", db=settings.db_path)
 
     # ── Sessions ───────────────────────────────────────────────────────────────
@@ -63,27 +71,30 @@ class SessionStore:
         """
         session_id = str(uuid.uuid4())
         now = _utcnow()
-        self._conn.execute(
-            "INSERT INTO sessions (id, created_at) VALUES (?, ?)",
-            (session_id, now),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sessions (id, created_at) VALUES (?, ?)",
+                (session_id, now),
+            )
+            self._conn.commit()
         log.info("session_created", session_id=session_id)
         return session_id
 
     def list_sessions(self) -> list[dict[str, str]]:
         """Return all sessions sorted newest-first."""
-        rows = self._conn.execute(
-            "SELECT id, created_at FROM sessions ORDER BY created_at DESC"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, created_at FROM sessions ORDER BY created_at DESC"
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def message_count(self, session_id: str) -> int:
         """Return how many messages are stored for a session."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
         return int(row["n"]) if row else 0
 
     # ── Messages ───────────────────────────────────────────────────────────────
@@ -106,24 +117,27 @@ class SessionStore:
         tool_calls = message.get("tool_calls")
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
 
-        self._conn.execute(
-            """
-            INSERT INTO messages
-                (session_id, role, content, tool_call_id, name, tool_calls_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session_id,
-                role,
-                message.get("content"),
-                message.get("tool_call_id"),
-                message.get("name"),
-                tool_calls_json,
-                _utcnow(),
-            ),
-        )
-        self._conn.commit()
-        self.load_history.cache_clear()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO messages
+                    (session_id, role, content, tool_call_id, name, tool_calls_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    role,
+                    message.get("content"),
+                    message.get("tool_call_id"),
+                    message.get("name"),
+                    tool_calls_json,
+                    _utcnow(),
+                ),
+            )
+            self._conn.commit()
+            # Invalidate INSIDE the lock: clearing after release lets another
+            # thread re-cache a snapshot that misses this row (stale history).
+            self.load_history.cache_clear()
 
     @lru_cache(maxsize=100)
     def load_history(
@@ -146,16 +160,17 @@ class SessionStore:
         limit = max(1, int(limit))
 
         # Newest-first fetch, then reverse to chronological order.
-        rows = self._conn.execute(
-            """
-            SELECT role, content, tool_call_id, name, tool_calls_json
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (session_id, limit),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT role, content, tool_call_id, name, tool_calls_json
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
 
         messages: list[dict[str, Any]] = []
         for row in reversed(rows):
@@ -192,36 +207,203 @@ class SessionStore:
         """Delete sessions older than max_age_days."""
         cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
         cutoff_iso = cutoff.isoformat()
-        
-        self._conn.execute(
-            "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE created_at < ?)",
-            (cutoff_iso,)
-        )
-        
-        cursor = self._conn.execute(
-            "DELETE FROM sessions WHERE created_at < ?",
-            (cutoff_iso,)
-        )
-        deleted = cursor.rowcount
-        self._conn.commit()
+
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE created_at < ?)",
+                (cutoff_iso,)
+            )
+
+            cursor = self._conn.execute(
+                "DELETE FROM sessions WHERE created_at < ?",
+                (cutoff_iso,)
+            )
+            deleted = cursor.rowcount
+            self._conn.commit()
         log.info("cleanup_old_sessions", deleted=deleted, max_age_days=max_age_days)
         return deleted
 
+    # ── Pending confirmations ──────────────────────────────────────────────────
+
+    def save_pending_confirmation(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_args: str,
+        tool_call_id: str,
+        risk_level: str,
+        context: dict[str, Any] | None = None,
+        ttl_minutes: int = CONFIRMATION_TTL_MINUTES,
+    ) -> None:
+        """
+        Persist a pending confirmation request to SQLite.
+
+        ``context`` carries the durable agent state needed to RESUME the
+        original workflow after resolution (original request, pending plan,
+        completed steps, execution mode). It is stored as JSON so the pause
+        survives process restarts exactly like the rest of the row.
+
+        Any previous pending confirmation for the same session is replaced
+        (one active confirmation per session at a time).
+        """
+        expires_at = (
+            datetime.now(tz=timezone.utc) + timedelta(minutes=ttl_minutes)
+        ).isoformat()
+        context_json = json.dumps(context or {}, separators=(",", ":"))
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO pending_confirmations
+                    (session_id, tool_name, tool_args, tool_call_id, risk_level,
+                     created_at, expires_at, completed_at, context_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    tool_name    = excluded.tool_name,
+                    tool_args    = excluded.tool_args,
+                    tool_call_id = excluded.tool_call_id,
+                    risk_level   = excluded.risk_level,
+                    created_at   = excluded.created_at,
+                    expires_at   = excluded.expires_at,
+                    completed_at = NULL,
+                    context_json = excluded.context_json
+                """,
+                (session_id, tool_name, tool_args, tool_call_id, risk_level,
+                 _utcnow(), expires_at, context_json),
+            )
+            self._conn.commit()
+        log.info(
+            "pending_confirmation_saved",
+            session_id=session_id,
+            tool_name=tool_name,
+            risk_level=risk_level,
+            expires_at=expires_at,
+        )
+
+    def load_pending_confirmation(self, session_id: str) -> dict[str, Any] | None:
+        """
+        Return the active pending confirmation for a session, or None.
+
+        Returns None if:
+        - No record exists for this session.
+        - The record has already been completed.
+        - The record has expired (TTL elapsed).
+        Expired records are deleted on access.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT session_id, tool_name, tool_args, tool_call_id,
+                       risk_level, created_at, expires_at, context_json
+                FROM pending_confirmations
+                WHERE session_id = ? AND completed_at IS NULL
+                """,
+                (session_id,),
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            # Check TTL
+            expires_at = datetime.fromisoformat(row["expires_at"])
+            if datetime.now(tz=timezone.utc) > expires_at:
+                log.warning(
+                    "pending_confirmation_expired",
+                    session_id=session_id,
+                    tool_name=row["tool_name"],
+                )
+                self._conn.execute(
+                    "DELETE FROM pending_confirmations WHERE session_id = ?",
+                    (session_id,),
+                )
+                self._conn.commit()
+                return None
+
+            data = dict(row)
+            # Deserialize the resume context; a corrupt/absent payload must
+            # not crash confirmation handling — resume degrades gracefully.
+            raw_ctx = data.pop("context_json", None)
+            try:
+                data["context"] = json.loads(raw_ctx) if raw_ctx else {}
+            except json.JSONDecodeError:
+                log.warning("pending_confirmation_context_corrupt", session_id=session_id)
+                data["context"] = {}
+            return data
+
+    def complete_pending_confirmation(self, session_id: str) -> dict[str, Any] | None:
+        """
+        Atomically mark a pending confirmation as completed and return its data.
+
+        Returns the confirmation data dict if one existed and was not expired,
+        or None otherwise. This is the "pop" equivalent of the old in-memory
+        _pending_confirmations.pop(session_id, None).
+        """
+        data = self.load_pending_confirmation(session_id)
+        if data is None:
+            return None
+
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE pending_confirmations
+                   SET completed_at = ?
+                 WHERE session_id = ? AND completed_at IS NULL
+                """,
+                (_utcnow(), session_id),
+            )
+            self._conn.commit()
+        log.info(
+            "pending_confirmation_completed",
+            session_id=session_id,
+            tool_name=data["tool_name"],
+        )
+        return data
+
+    def cleanup_expired_confirmations(self) -> int:
+        """
+        Delete all expired or completed confirmation rows.
+        Returns the number of rows removed.
+        """
+        now = _utcnow()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM pending_confirmations
+                WHERE completed_at IS NOT NULL
+                   OR expires_at < ?
+                """,
+                (now,),
+            )
+            self._conn.commit()
+            removed = cursor.rowcount
+        if removed:
+            log.info("cleanup_expired_confirmations", removed=removed)
+        return removed
+
     def close(self) -> None:
         """Close the database connection cleanly."""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _get_connection() -> sqlite3.Connection:
-    """Open (or create) the SQLite database and return a connection."""
+    """
+    Open (or create) the SQLite database and return a connection.
+
+    File-backed databases run in WAL mode with synchronous=NORMAL: writers no
+    longer block readers (the API serves history while a chat turn commits),
+    and the DB survives sudden process death without corruption. WAL only
+    works on real files, so :memory: keeps the default journal mode.
+    """
     db_path = Path(settings.db_path)
     # ":memory:" must not be passed through Path (would become a relative file).
     if settings.db_path == ":memory:":
-        conn = sqlite3.connect(":memory:")
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
     else:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -247,7 +429,27 @@ def _init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_messages_session
             ON messages (session_id, id);
+
+        CREATE TABLE IF NOT EXISTS pending_confirmations (
+            session_id   TEXT    PRIMARY KEY,
+            tool_name    TEXT    NOT NULL,
+            tool_args    TEXT    NOT NULL,
+            tool_call_id TEXT    NOT NULL,
+            risk_level   TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL,
+            expires_at   TEXT    NOT NULL,
+            completed_at TEXT,
+            context_json TEXT
+        );
     """)
+    # Lightweight migration for pre-v0.15 databases: older installations
+    # created this table without the resume-context column.
+    existing_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(pending_confirmations)").fetchall()
+    }
+    if "context_json" not in existing_cols:
+        conn.execute("ALTER TABLE pending_confirmations ADD COLUMN context_json TEXT")
     conn.commit()
 
 

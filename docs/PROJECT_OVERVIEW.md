@@ -1,184 +1,166 @@
 # JARVIS — Project Overview
 
-**Version:** 0.1.0  
-**License:** MIT  
-**Tagline:** A local, modular personal AI assistant — powered by Ollama. No paid APIs. No cloud lock-in.
+**Version:** 0.16.0
+**License:** MIT
+**Tagline:** A local-first AI assistant — one agent runtime, multiple interfaces. Powered by Ollama. No paid APIs. No cloud lock-in.
 
-This document is a handoff-style overview: what JARVIS is, how it is built today, what it can already do, and where it is headed. It is meant for collaborators, reviewers, or anyone who needs to understand the project without reading every source file.
+This is a handoff-style overview: what JARVIS is today, what it can and cannot do, and where it is headed. For layer-by-layer internals see [`architecture.md`](architecture.md).
 
 ---
 
 ## 1. Vision
 
-JARVIS aims to become a **fully local personal AI assistant** that lives on the user’s machine: private by default, extendable through tools, and capable enough to help with research, files, calculation, and (later) voice, vision, and computer control.
+JARVIS aims to become a **fully local personal AI assistant** that lives on the user's machine: private by default, extendable through tools, and able to *act* through tools rather than only chat — with a permission model that makes acting safe.
 
-The name is intentional — not as a movie clone, but as a design target: a capable assistant that feels coherent, remembers context, and can *act* through tools rather than only chat.
-
-**Non-negotiables for the current phase:**
+**Non-negotiables:**
 
 - Runs locally (Ollama + local Python app)
 - Free stack for core features (no required paid LLM or search APIs)
-- Modular architecture so features can grow without rewriting the core
-- Privacy-first: conversation data stays on disk under the user’s control
+- Modular architecture: features grow without rewriting the core
+- Privacy-first: conversation data stays on disk under the user's control
+- **Safety is structural, not prompt-based:** dangerous capability is absent or gated, never merely discouraged
 
 ---
 
-## 2. What Exists Today (v0.1)
-
-JARVIS v0.1 is a **text-based CLI assistant** with:
+## 2. What Exists Today (v0.10)
 
 | Capability | Status |
 |---|---|
-| Local LLM chat via Ollama | Done |
-| Autonomous tool calling (ReAct-style loop) | Done |
-| Persistent short-term session memory (SQLite) | Done |
-| Free web search (DuckDuckGo via `ddgs`) | Done |
-| Wikipedia topic summaries | Done |
-| Sandboxed file read / directory listing | Done |
-| Safe calculator | Done |
-| Current date/time | Done |
-| Rich terminal UX (panels, Markdown, commands) | Done |
-| Offline unit tests for tools & memory | Done |
-| Permission framework (stub, ready to harden) | Scaffolded |
-| Vector / long-term memory | Not yet (planned v0.2) |
-| Multi-step agent planner beyond tool loop | Not yet (planned v0.3) |
-| Voice / vision / browser automation / web UI | Later roadmap |
+| Local LLM chat via Ollama (LiteLLM wrapper) | Done |
+| Plan-and-Execute agent loop + fast ReAct path with intent routing | Done |
+| Tool calling: web search, scrape, Wikipedia, files, calculator, vision, facts | Done (11 active tools) |
+| Persistent session memory (SQLite, thread-safe) | Done |
+| Context management: windowing, anchoring, rolling summary, tool-output clamping | Done |
+| Long-term memory (ChromaDB) + `remember_fact` / `recall_facts` | Done |
+| Permission tiers + durable SQLite confirmations for high-risk tools | Done |
+| Resumable confirmations: approval/denial continues the original task (restart-safe) | Done |
+| Sandbox timeouts enforced at the workload boundary (container `timeout` + host force-removal) | Done |
+| Self-correction loop on tool errors (with recovery hints) | Done |
+| Async/concurrent tool dispatch per round | Done |
+| REST API (FastAPI): `/chat`, SSE `/chat/stream`, opt-in API-key auth, rate limiting, per-session serialization, sessions, confirmations, tool surface | Done |
+| Stdlib API client (`jarvis/api/client.py`); dashboard consumes the API (optional legacy fallback) | Done |
+| Dedicated minimal sandbox image + immutable-image policy (no `latest`) in `deploy/` | Done |
+| Container deployment: `Dockerfile`, `docker-compose.yml` (+ optional Ollama profile), CI workflow, maintenance CLI, request IDs | Done |
+| Operational readiness: deep health (503 on broken persistence), sanitized correlated errors, WAL persistence, `doctor` command | Done |
+| CLI (Rich REPL) and Streamlit dashboard over the same runtime | Done |
+| Voice mode (Whisper STT + Edge TTS) | Done (needs internet for TTS) |
+| Agent-step observability (`on_event` hook + true interleaved SSE + keepalives) | Done |
+| Live-model eval harness (32 cases, per-case timeouts, category breakdowns, JSON reports, nightly CI) | Done |
+| **Code execution (`execute_python_code`)** | **Opt-in, Docker-isolated, off by default; registers only when Docker verifies usable (not on Windows hosts)** |
+| **Computer control (`computer_control`)** | **Disabled — pure placeholder, no OS automation** |
 
-**Default model:** `qwen2.5:7b` (tool-calling capable).  
-**Runtime requirement:** Ollama must be running (`ollama serve` or the Ollama desktop app).
+**Default model:** `qwen2.5:7b` (tool-calling capable), planner on the same model (`planner_model` config).
+**Runtime requirement:** Ollama running locally (`ollama serve` or the desktop app). The REST API does not need Ollama to boot, only to answer chats.
 
 ---
 
 ## 3. High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         User (CLI)                          │
-│                    Rich terminal interface                  │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     jarvis/main.py                          │
-│         Wires components + REPL (/help, /tools, …)          │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Orchestrator (core/orchestrator.py)            │
-│         ReAct loop: think → tool calls → answer             │
-└───────┬──────────────────┬──────────────────┬───────────────┘
-        │                  │                  │
-        ▼                  ▼                  ▼
-┌───────────────┐  ┌───────────────┐  ┌───────────────────────┐
-│ SessionStore  │  │ Permission    │  │ LLM Client            │
-│ (SQLite)      │  │ Guard (stub)  │  │ LiteLLM → Ollama      │
-└───────────────┘  └───────────────┘  └───────────┬───────────┘
-                                                  │
-                                                  ▼
-                                      ┌───────────────────────┐
-                                      │ ToolRegistry          │
-                                      │ + concrete tools      │
-                                      └───────────────────────┘
+        CLI (main.py)        REST API (jarvis/api)      Dashboard (Streamlit)     Voice
+              │                       │                        │                  │
+              └───────────────────────┼────────────────────────┘                  │
+                                      ▼                                           │
+                    JarvisRuntime (jarvis/runtime.py)  ◄──────────────────────────┘
+                    build_runtime() → store + 11 tools + guard + orchestrator
+                                      │
+        ┌─────────────────┬───────────┼──────────────────┬─────────────────┐
+        ▼                 ▼           ▼                  ▼                 ▼
+  Orchestrator       ToolRegistry  PermissionGuard  SessionStore      LLM client
+  route→plan→        (capabilities) (risk tiers +   (SQLite,          (LiteLLM →
+  execute→synthesize               confirmations)   thread-safe)      Ollama)
 ```
 
-### Request lifecycle (one user message)
+The one rule that keeps this coherent: **interfaces never wire components themselves** — they call `build_runtime()` and talk to the returned `JarvisRuntime`. CLI, API, and dashboard therefore always expose the identical capability surface.
 
-1. User types a message in the CLI.
-2. `main.py` calls `orchestrator.chat(session_id, user_input)`.
-3. Orchestrator saves the user message to SQLite.
-4. It loads a **recent history window**, injects the system prompt (+ a short memory cue), and calls the LLM with tool schemas.
-5. If the model returns **tool calls**:
-   - PermissionGuard checks each tool
-   - ToolRegistry dispatches execution
-   - Results are saved and fed back to the model
-   - Loop continues (capped at 5 tool rounds)
-6. If the model returns **plain text**, that is the final answer.
-7. CLI renders the answer as Markdown in a Rich panel.
+### Request lifecycle
 
-This is the classic **ReAct (Reason + Act)** pattern, kept deliberately simple and testable.
+1. User turn is persisted to SQLite.
+2. Context is loaded and compacted (`ContextManager`: window → anchor → summarize → clamp).
+3. `route_intent` classifies: `simple` → direct ReAct loop; `complex` → Plan → Execute → Synthesize.
+4. Tools dispatch through `PermissionGuard` (auto-allow / block / confirm-and-persist).
+5. Tool errors trigger a bounded self-correction loop with recovery hints.
+6. A final synthesis call produces the answer.
+
+Details (including the confirmation flow and context budget math): [`architecture.md`](architecture.md).
 
 ---
 
-## 4. Repository Structure
+## 4. Repository Structure (v0.10)
 
 ```
 JARVIS/
-├── jarvis/                      # Application package
-│   ├── main.py                  # CLI entry + dependency wiring
-│   ├── config.py                # Settings from .env (pydantic-settings)
-│   ├── __init__.py              # Version (__version__ = 0.1.0)
+├── jarvis/
+│   ├── runtime.py               # Assembly seam: build_runtime() + JarvisRuntime
+│   ├── api/                     # FastAPI service layer
+│   │   ├── app.py               #   /health /sessions /chat /chat/stream /confirm /tools
+│   │   ├── auth.py              #   Opt-in API-key enforcement (constant-time)
+│   │   └── schemas.py           #   Typed request/response models
+│   ├── main.py                  # CLI entry + REPL (uses build_runtime())
+│   ├── config.py                # Single settings surface (pydantic-settings)
 │   ├── core/
-│   │   ├── orchestrator.py      # Brain: ReAct tool-calling loop
-│   │   └── permissions.py       # PermissionGuard (permissive stub in v0.1)
-│   ├── llm/
-│   │   └── client.py            # LiteLLM wrapper → Ollama
+│   │   ├── orchestrator.py      # Route → Plan → Execute → Synthesize
+│   │   ├── planner.py           # JSON plan generation with fallback
+│   │   ├── permissions.py       # PermissionGuard risk tiers
+│   │   └── sandbox.py           # CodeSandbox ABC + fail-closed implementations
+│   ├── llm/client.py            # LiteLLM → Ollama
 │   ├── memory/
-│   │   └── session_store.py     # SQLite sessions + messages
-│   ├── tools/
-│   │   ├── base.py              # BaseTool abstract interface
-│   │   ├── registry.py          # Register / schema export / dispatch
-│   │   ├── datetime_tool.py     # get_current_datetime
-│   │   ├── web_search.py        # web_search (ddgs / DuckDuckGo)
-│   │   ├── wikipedia_summary.py # wikipedia_summary (Wikipedia API)
-│   │   ├── file_reader.py       # read_file (sandboxed)
-│   │   ├── directory_lister.py  # list_directory (sandboxed)
-│   │   └── calculator.py        # calculator (safe expression eval)
-│   └── utils/
-│       └── logging.py           # structlog setup
-├── tests/
-│   ├── conftest.py
-│   ├── test_tools.py
-│   └── test_session_store.py
-├── docs/
-│   ├── architecture.md          # Architecture notes
-│   └── PROJECT_OVERVIEW.md      # This document
-├── pyproject.toml               # Package metadata + dependencies
-├── README.md                    # Install / run guide
-├── .env.example                 # Config template
-└── jarvis.db                    # Local SQLite DB (created at runtime)
+│   │   ├── session_store.py     # SQLite sessions/messages/confirmations (RLock)
+│   │   ├── context_manager.py   # Windowing, anchoring, summary, clamping
+│   │   └── vector_store.py      # ChromaDB long-term memory
+│   ├── tools/                   # 11 active tools + disabled placeholders
+│   └── voice/                   # Whisper + TTS
+├── ui/dashboard.py              # Streamlit dashboard (consumes the runtime)
+├── evaluation/                  # Offline eval harnesses (run_evals, tool_selection)
+├── tests/                       # Offline pytest suite
+├── docs/                        # architecture.md, this file
+└── pyproject.toml
 ```
 
-### Design principles baked into the layout
+### Design principles
 
-1. **Dependency injection** — `main.py` builds real objects; Orchestrator never constructs its own DB/LLM/tools. This keeps unit testing easy.
-2. **Manual tool registration** — tools are registered explicitly in `main.py` (no magic auto-discovery), so the active capability surface is obvious.
-3. **Provider abstraction** — all model calls go through LiteLLM. Switching providers later is mostly a model-string / config change.
-4. **Tool contract** — every tool subclasses `BaseTool`, exposes OpenAI-style JSON Schema, and returns a **string** (success or `ERROR: …`). Exceptions inside tools are caught at the registry boundary so the loop stays stable.
-5. **Config centralization** — `jarvis/config.py` is the single settings surface (model, DB path, sandbox dir, history window, system prompt).
+1. **One assembly point** — `build_runtime()` is the only place components are wired; interfaces stay thin.
+2. **Dependency injection** — `Orchestrator` receives store/registry/guard; nothing constructs its own DB or LLM client.
+3. **Explicit capability surface** — tools are registered in a visible tuple (`_TOOL_FACTORIES`), not auto-discovered.
+4. **Tool contract** — every tool subclasses `BaseTool`, declares a `risk_level`, exposes JSON Schema, returns a string (`ERROR:` prefix marks failure). Exceptions are caught at the registry boundary.
+5. **Config centralization** — `jarvis/config.py` is the single settings surface.
+6. **Fail-closed dangerous paths** — disabled tools are absent from the registry *and* fail closed if ever instantiated.
 
 ---
 
 ## 5. Current Tools (Capability Surface)
 
-| Tool name | Purpose | Notes |
+| Tool name | Purpose | Risk tier |
 |---|---|---|
-| `get_current_datetime` | Local date, time, weekday, UTC offset | No network |
-| `web_search` | Live web search via DuckDuckGo (`ddgs`) | Free, no API key; returns numbered excerpts for synthesis |
-| `wikipedia_summary` | Short encyclopedia summary | Free Wikipedia public API; preferred for topic overviews |
-| `read_file` | Read a text file | Sandboxed to `FILE_READER_ALLOWED_DIR` |
-| `list_directory` | List folder contents | Same sandbox rules |
-| `calculator` | Evaluate math expressions | Restricted AST eval (no arbitrary code) |
+| `get_current_datetime` | Local date, time, weekday, UTC offset | SAFE |
+| `calculator` | Restricted AST math eval (no arbitrary code) | SAFE |
+| `wikipedia_summary` | Encyclopedia summaries (free API) | NETWORK |
+| `web_search` | DuckDuckGo via `ddgs`, TTL-cached | NETWORK |
+| `web_scrape` | Playwright-based page extraction | NETWORK |
+| `vision_analyze` | Image understanding (Llava via Ollama) | SAFE |
+| `read_file` | Text file read, sandboxed to `FILE_READER_ALLOWED_DIR` | FILE_READ |
+| `list_directory` | Directory listing, same sandbox | FILE_READ |
+| `remember_fact` / `recall_facts` | Long-term personal memory (ChromaDB) | SAFE |
+| `write_file` | File write | **FILE_WRITE — currently blocked by the guard** |
+| `execute_python_code` | Code execution | **DISABLED — not registered; sandbox not implemented** |
+| `computer_control` | OS automation | **DISABLED — not registered; pure placeholder** |
 
-**CLI meta-commands** (not LLM tools): `/help`, `/tools`, `/history`, `/new`, `/quit`.
+CLI meta-commands (not LLM tools): `/help`, `/tools`, `/history`, `/confirm`, `/deny`, `/new`, `/voice`, `/quit`.
 
 ---
 
-## 6. Memory Model (Today vs Tomorrow)
+## 6. Memory Model
 
-### Today — short-term session memory
+### Short-term (SQLite)
+- Sessions + messages tables; OpenAI-compatible roles; the system prompt is never persisted.
+- Every read/write goes through a `threading.RLock`, so CLI, API workers, and the dashboard can share a store safely.
+- History loading trims orphan `tool` messages so a window never starts mid tool-call chain.
 
-- Conversations are stored in **SQLite** (`jarvis.db` by default).
-- Tables: `sessions`, `messages` (OpenAI-compatible roles: user / assistant / tool / system).
-- On each turn, JARVIS loads the **most recent N messages** (default `MAX_HISTORY_MESSAGES=40`), not the oldest — so long chats keep fresh context.
-- Leading orphan `tool` messages are trimmed so a history window never starts mid tool-call chain.
-- Large old tool payloads are truncated when reloaded, to leave room for dialogue.
-- The system prompt is **not** stored in the DB; it is injected fresh every call.
-- A short “memory cue” system message reminds the model that prior turns are available for follow-ups.
+### Prompt-facing (ContextManager)
+- 24-message LLM window (`MAX_CONTEXT_MESSAGES`), older turns compacted into a deterministic `[Context summary]`, original task anchored, tool outputs clamped to 6000 chars (head+tail, full payload kept in SQLite).
 
-### Not yet — long-term / semantic memory
-
-Vector DB (e.g. ChromaDB), RAG over past sessions, and cross-session recall are **planned for v0.2**, not implemented now.
+### Long-term (ChromaDB)
+- `remember_fact` / `recall_facts` give the agent durable personal memory; the vector store binds to a session on `start_session()`.
 
 ---
 
@@ -186,114 +168,111 @@ Vector DB (e.g. ChromaDB), RAG over past sessions, and cross-session recall are 
 
 | Layer | Choice | Why |
 |---|---|---|
-| Language | Python 3.11+ | Clear tooling ecosystem for agents |
-| Packaging | `pyproject.toml` + hatchling; run via `jarvis` script | Standard, installable package |
-| LLM runtime | Ollama | Local models, no cloud bill for inference |
-| LLM API glue | LiteLLM | One interface; portable to other providers later |
-| Search | `ddgs` (DuckDuckGo) | Free, no key |
-| Knowledge lookup | Wikipedia REST / OpenSearch | Free, reliable summaries |
+| Language | Python 3.11+ | Tooling ecosystem |
+| Packaging | `pyproject.toml` (hatchling), run via `uv` | Reproducible envs |
+| LLM runtime | Ollama | Local inference, no cloud bill |
+| LLM glue | LiteLLM | Provider-portable model strings |
+| API | FastAPI + uvicorn | Typed service layer, async-friendly |
+| Persistence | sqlite3 | Zero-ops durability |
+| Long-term memory | ChromaDB | Local vector store |
+| Search / scrape | `ddgs`, Playwright | Free retrieval |
+| CLI / UI | Rich / Streamlit | Terminal polish / quick dashboards |
 | Config | pydantic-settings + `.env` | Typed, fail-fast |
-| Persistence | sqlite3 | Zero ops for v0.1 |
-| CLI UX | Rich | Panels, Markdown, tables, spinners |
-| Logging | structlog | Structured, readable logs |
-| Tests | pytest | Offline unit tests for tools & memory |
+| Tests | pytest | Fully offline suite |
 
 ---
 
-## 8. How to Run (Quick)
+## 8. How to Run
 
-Prerequisites: Python 3.11+, Ollama installed, model pulled (e.g. `ollama pull qwen2.5:7b`).
+Prerequisites: Python 3.11+, Ollama installed with a model pulled (`ollama pull qwen2.5:7b`).
 
 ```bash
-# Install
-uv venv
-# activate venv, then:
-uv pip install -e ".[dev]"
-cp .env.example .env
+uv sync --extra dev          # install dependencies
+cp .env.example .env         # defaults are fine for local Ollama
 
-# Ensure Ollama is running
-ollama serve   # if not already running via the app
+# CLI (primary interface)
+uv run jarvis
+# or: uv run python -m jarvis.main
 
-# Start JARVIS
-jarvis
-# or: python -m jarvis.main
+# REST API (v0.10)
+uv run uvicorn jarvis.api.app:app --port 8000
+# interactive docs: http://localhost:8000/docs
 
-# Tests
-pytest
+# Dashboard
+uv run streamlit run ui/dashboard.py
+
+# Tests (offline, no Ollama needed)
+uv run pytest -v
+
+# Evaluation harness (needs a live Ollama; see flags with --help)
+uv run python evaluation/run_evals.py --json report.json
 ```
 
-If chat fails with connection refused / WinError 10061, Ollama is not listening on `http://localhost:11434`.
+---
+
+## 9. Security & Safety Posture
+
+- **Local-first:** chat history stays in local SQLite; ChromaDB lives under `jarvis_data/`.
+- **Dangerous tools are gated, not prompted:** `computer_control` is never registered (pure placeholder). `execute_python_code` registers only behind the double gate (config flag + verified Docker), runs in a hardened one-shot container, and every failure mode is a denial — never host execution.
+- **Permission tiers:** SAFE/NETWORK/FILE_READ auto-allowed; SYSTEM/DESTRUCTIVE require persisted confirmation; FILE_WRITE currently blocked outright by the guard.
+- **Durable confirmations:** pending high-risk actions survive restarts and can be resolved from any interface.
+- **No `exec()`/`eval()`** on model-influenced strings; the calculator uses a restricted AST walker; the code sandbox contract denies by default.
+- **Hard loop caps:** 5 tool rounds per request, 2 per step, 2 self-correction attempts.
+
+Full details: [`architecture.md` § Safety Model](architecture.md).
 
 ---
 
-## 9. Roadmap — What It Will Have
+## 10. Extending the Project
 
-The project is intentionally versioned as a progressive build-out:
+### Add a tool
+1. `jarvis/tools/my_tool.py` subclassing `BaseTool` (`name`, `description`, `parameters`, `risk_level`, `run()`).
+2. Add to `_TOOL_FACTORIES` in `jarvis/runtime.py`.
+3. Export from `jarvis/tools/__init__.py`; add tests; optionally add one prompt-guidance line in `config.py`.
 
-| Version | Goal | Intent |
+### Read-first onboarding order
+1. `README.md` — install & run
+2. `docs/JARVIS_USER_MANUAL.md` — operating JARVIS: capability matrix, prerequisites, startup, troubleshooting
+3. `docs/architecture.md` — layers, lifecycle, safety model
+4. `docs/JARVIS_DEVELOPER_MANUAL.md` — architecture rationale, request lifecycle, extension guides, debugging flow
+5. `jarvis/runtime.py` — the assembly seam
+6. `jarvis/core/orchestrator.py` — the agent loop
+7. `jarvis/memory/context_manager.py` + `session_store.py`
+8. `jarvis/api/app.py` — service surface
+
+---
+
+## 11. Roadmap
+
+| Version | Goal | Status |
 |---|---|---|
-| **v0.1 (current)** | CLI + Ollama + tool calling + SQLite short-term memory | Solid core loop and modular tool system |
-| **v0.2** | Persistent **vector memory** (e.g. ChromaDB) + RAG | Remember facts across sessions; retrieve relevant past context |
-| **v0.3** | Stronger **multi-step agent loop** for complex tasks | Plan → act → verify beyond simple tool rounds |
-| **v0.4** | **Voice** input (Whisper) + TTS output | Hands-free interaction |
-| **v0.5** | **Vision** (image understanding) | Screenshots / photos as context |
-| **v0.6** | Browser + computer automation with a real **permission model** | Act on the OS/web safely, with confirmation for risky actions |
-| **v0.7** | **Web UI** (React + FastAPI) | Richer interface while keeping the same core |
+| v0.1 | CLI + tools + SQLite memory | ✅ |
+| v0.2 | ChromaDB long-term memory | ✅ |
+| v0.3 | Plan-and-Execute loop | ✅ |
+| v0.4 | Voice (Whisper + Edge TTS) | ✅ |
+| v0.5 | Streamlit dashboard + write_file | ✅ |
+| v0.6 | Vision + Playwright scrape | ✅ |
+| v0.8 | Permission tiers + durable confirmations + caching | ✅ |
+| v0.9 | Service-oriented: JarvisRuntime seam + FastAPI API layer | ✅ |
+| v0.10 | Real Docker-isolated code execution (opt-in), API auth, SSE streaming, observability seam | ✅ |
+| v0.11 | Deploy-ready service: rate limiting, per-session serialization, dedicated sandbox image, API-first dashboard | ✅ |
+| v0.12 | Ship path: docker-compose, service image, CI, request IDs, maintenance CLI, dispatch dedup | ✅ |
+| v0.13 | Operate: deep health, sanitized correlated errors, WAL persistence, `doctor`, shared test fakes | ✅ |
+| v0.14 | Live-model quality loop: practical eval harness, nightly CI evals, true SSE interleaving, planner grounding | ✅ |
+| v0.15 | Reliability & security closure: workload-timeout sandbox, resumable confirmations, CI trust boundary | ✅ |
+| **v0.16** | **Production readiness & live validation: digest-pinned sandbox verified against a real Docker daemon, 32-case live-model evaluation run and classified, sharper eval signal (`--compare`, failure details), sandbox integration test suite** | ✅ **current** |
+| v0.17 (recommended) | Confirmation/action idempotency keys; semantic eval layer (LLM judge as a *secondary*, non-gating signal); WebSocket token streaming; shared rate-limit store for multi-replica | Planned |
+| Later | Long-term memory consolidation, scheduled tasks, multi-user sessions | Exploratory |
 
-### Directional product picture (end state)
-
-A private assistant that can:
-
-- Talk in text and voice
-- See images
-- Search the web and reference knowledge sources
-- Read/write files and automate the computer under explicit permissions
-- Remember important things long-term
-- Offer both CLI and web interfaces
-- Stay swappable at the model layer (local first; cloud optional later via LiteLLM)
-
----
-
-## 10. Security & Safety Posture (Current)
-
-- **Local-first:** chat history stays in local SQLite.
-- **File tools are sandboxed** to an allowed directory.
-- **Calculator is restricted** (no shell/code execution).
-- **PermissionGuard exists** but currently allows all registered tools — intentional scaffold for v0.6-style risk levels (SAFE / NETWORK / FILE_WRITE / SYSTEM / DESTRUCTIVE).
-- Tool loop has a **hard cap** (`MAX_TOOL_ROUNDS = 5`) to prevent runaway tool calling.
-- No FastAPI/React/voice surface yet — attack surface is intentionally small in v0.1.
+### End-state picture
+A private assistant that talks in text and voice, sees images, searches and reads the web, reads/writes files and automates the computer **under explicit, durable permissions**, remembers important things long-term, and offers CLI, web, and API interfaces — while staying local-first and model-swappable.
 
 ---
 
-## 11. Extending the Project
+## 12. One-Paragraph Summary
 
-### Add a new tool (checklist)
-
-1. Create `jarvis/tools/my_tool.py` subclassing `BaseTool`
-2. Define `name`, `description`, `parameters` (JSON Schema), and `run()`
-3. Register in `jarvis/main.py`
-4. Export from `jarvis/tools/__init__.py`
-5. Add tests in `tests/test_tools.py`
-6. Mention it in the system prompt tool policy (`config.py`) if the model should know when to use it
-
-Nothing else in the orchestrator needs to change for a normal tool.
-
-### Key files to read first (onboarding order)
-
-1. `README.md` — install & run  
-2. `docs/PROJECT_OVERVIEW.md` — this file  
-3. `docs/architecture.md` — lifecycle details  
-4. `jarvis/main.py` — wiring  
-5. `jarvis/core/orchestrator.py` — agent loop  
-6. `jarvis/tools/` — capability implementations  
-7. `jarvis/memory/session_store.py` — short-term memory  
+**JARVIS is a local-first AI assistant (v0.16) built in Python.** One agent runtime (Plan-and-Execute + fast ReAct path, 11 tools plus an opt-in Docker-isolated code-execution tool, permission tiers, SQLite sessions, ChromaDB memory, context management, self-correction) is shared by three interfaces: a Rich CLI, a FastAPI REST service with optional API-key auth and SSE streaming, and a Streamlit dashboard. It runs on Ollama via LiteLLM with no paid APIs. Computer control remains structurally disabled; code execution is real container isolation (digest-pinned image, runtime-verified boundary on Linux) but ships off unless explicitly enabled and Docker verifies usable. The roadmap continues toward action idempotency, a secondary semantic eval layer, and richer long-term memory.
 
 ---
 
-## 12. One-Paragraph Summary (for quick sharing)
-
-**JARVIS is a local personal AI assistant (v0.1) built in Python.** It chats through a Rich CLI, runs models via Ollama (through LiteLLM), calls tools in a ReAct loop, and stores short-term conversation history in SQLite. Today it can search the web (DuckDuckGo), summarize Wikipedia topics, read sandboxed files, list directories, calculate, and tell the time — all without paid APIs. The architecture is modular on purpose: tools plug in cleanly, permissions are stubbed for future hardening, and the roadmap grows toward long-term vector memory, stronger multi-step agency, voice, vision, computer control, and a web UI — while staying local- and privacy-first.
-
----
-
-*Generated for project handoff / collaboration. Current codebase version: **0.1.0**.*
+*Current codebase version: **0.16.0**.*
