@@ -28,10 +28,16 @@ _MAX_SUMMARY_CHARS = 1200
 class WikipediaSummaryTool(BaseTool):
     name = "wikipedia_summary"
     description = (
-        "Get a clean, short encyclopedia summary from Wikipedia for a person, "
-        "place, concept, or topic. Prefer this over web_search for general "
-        "background knowledge and definitions. Do NOT use for breaking news "
-        "or rapidly changing live data."
+        "Fetch a short encyclopedia summary from Wikipedia for a named topic. "
+        "PURPOSE: stable background knowledge — who someone is, what a "
+        "concept/place/thing is. "
+        "WHEN TO USE: general knowledge and definitions the user asks about "
+        "(not about their own documents or personal facts). "
+        "WHEN NOT TO USE: current events or fast-changing data (use "
+        "web_search), the user's documents (search_knowledge), or pure "
+        "reasoning questions. "
+        "INPUT: topic or entity name. OUTPUT: short summary with article URL; "
+        "a not-found notice (never invented content) if no article exists."
     )
     parameters = {
         "type": "object",

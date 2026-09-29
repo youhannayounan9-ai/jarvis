@@ -22,9 +22,14 @@ log = get_logger(__name__)
 class ListDirectoryTool(BaseTool):
     name = "list_directory"
     description = (
-        "List the contents (files and folders) of a specified directory on the local filesystem. "
-        "The path must be relative to the allowed working directory. "
-        "ONLY use this tool when the user asks to see what files or folders exist in a specific path."
+        "List files and folders of a directory inside the allowed sandbox. "
+        "PURPOSE: discover what exists at a path. "
+        "WHEN TO USE: the user asks what files/folders exist in a location. "
+        "WHEN NOT TO USE: reading file contents (read_file), searching the "
+        "ingested knowledge base (search_knowledge), or paths outside the "
+        "sandbox (refused). "
+        "INPUT: directory path within the allowed directory. OUTPUT: a "
+        "grouped listing (folders first) or an ERROR string."
     )
     parameters = {
         "type": "object",

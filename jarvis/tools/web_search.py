@@ -34,14 +34,17 @@ _search_cache = TTLCache(maxsize=100, ttl=3600)
 class WebSearchTool(BaseTool):
     name = "web_search"
     description = (
-        "Search the live web via DuckDuckGo for current or specific factual "
-        "information. Returns numbered result excerpts (title, URL, snippet). "
-        "ONLY use when: (1) the user explicitly asks you to search the web, or "
-        "(2) the answer needs information that may have changed after your "
-        "training cutoff (news, prices, scores, recent events). "
-        "After receiving results: synthesize a clear answer from the snippets — "
-        "extract concrete facts, numbers, names, and dates. Do NOT dump a list "
-        "of links. Prefer wikipedia_summary for encyclopedia-style topic overviews."
+        "Search the live web for current external information. "
+        "PURPOSE: fresh, real-world facts beyond your training data. "
+        "WHEN TO USE: news, prices, scores, weather, recent events, or any "
+        "fact the user explicitly asks you to look up. "
+        "WHEN NOT TO USE: stable background knowledge (use wikipedia_summary), "
+        "the user's personal facts (recall_facts) or documents "
+        "(search_knowledge), arithmetic (calculator), or questions already "
+        "answered in the conversation. "
+        "INPUT: focused query (+ optional max_results 1-10). OUTPUT: numbered "
+        "excerpts (title, URL, snippet) to synthesize from — never invent "
+        "results when the search finds nothing relevant."
     )
     parameters = {
         "type": "object",

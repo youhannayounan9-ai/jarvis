@@ -81,6 +81,13 @@ class Settings(BaseSettings):
     # (e.g. ubuntu:24.04@sha256:...) — validated at sandbox construction.
     SANDBOX_IMAGE: str = "ubuntu:24.04"
 
+    # ── Tool-selection policy (v0.21) ─────────────────────────────────
+    # JARVIS_DISABLE_TOOL_POLICY=true disables the v0.21 capability-aware
+    # tool policy (tool-selection contract block, fast-path tool safety net,
+    # ReAct schema narrowing) and restores the exact v0.20 prompt behavior.
+    # Used by the live A/B tool-selection benchmark and as an escape hatch.
+    JARVIS_DISABLE_TOOL_POLICY: bool = False
+
     # ── API auth (v0.10) ─────────────────────────────────────────────
     # Empty API key disables authentication (local-only deployments).
     # Set JARVIS_API_KEY to require `Authorization: Bearer <key>` on every
@@ -141,7 +148,8 @@ class Settings(BaseSettings):
 
             "## Tool Selection Guide\n"
             "- Time relative to NOW ('today', 'tomorrow', 'next week') → get_current_datetime.\n"
-            "- Math expressions → calculator.\n"
+            "- Math expressions → calculator. NEVER do arithmetic mentally: any sum, difference, product, quotient, or span you state without a calculator result is wrong. Conceptual math explanations need no tool.\n"
+            "- The user's OWN documents/notes ('my roadmap', 'my notes', 'my knowledge base', 'the file I ingested') → search_knowledge FIRST. Never answer from imagination about their contents; if its evidence does not cover the question, say so plainly.\n"
             "- General knowledge about a person, place, or concept → wikipedia_summary (free, offline); web_search only for recency or niche facts.\n"
             "- Current events, prices, news, anything possibly changed recently → web_search.\n"
             "- Full text of a specific URL → web_scrape.\n"

@@ -15,6 +15,7 @@ Safety bounds:
 
 import json
 import re
+import uuid
 import time
 from collections.abc import Callable
 from typing import Any
@@ -22,6 +23,16 @@ from typing import Any
 from jarvis.config import settings
 from jarvis.core.permissions import PermissionGuard
 from jarvis.core.planner import Planner
+from jarvis.core.dispatch_guard import DispatchLedger
+from jarvis.core.plan_quality import report_plan_quality
+from jarvis.core.plan_validator import validate_plan
+from jarvis.core.tool_policy import (
+    build_tool_policy_block,
+    detect_unmet_capability,
+    extract_arithmetic,
+    is_single_intent_obligation,
+    narrow_schemas_for_react,
+)
 from jarvis.llm.client import chat_completion
 from jarvis.memory.context_manager import ContextManager, estimate_tokens
 from jarvis.memory.session_store import (
@@ -89,12 +100,21 @@ class Orchestrator:
         self._planner = Planner(
             llm_client=chat_completion,
             tool_names=tool_registry.list_tools(),
+            # v0.22: the planner plans by CAPABILITY, so it sees what each
+            # tool does (compact one-liners), not just bare names.
+            tool_descriptions={
+                t.name: t.description for t in tool_registry._tools.values()
+            },
         )
         self._context = ContextManager()
         # "simple" | "complex" for the turn currently executing on this
         # orchestrator; captured into the durable pause context so resume
         # knows whether the paused step came from the fast path or a plan.
         self._current_mode = "complex"
+        # v0.23 (Parts C/E): per-turn ledger of successful dispatch
+        # fingerprints. One user request = one ledger; a resumed turn
+        # rebuilds from persisted state instead of carrying stale entries.
+        self._dispatch_ledger = DispatchLedger()
 
     def route_intent(self, user_input: str) -> str:
         """
@@ -115,6 +135,37 @@ class Orchestrator:
             "create an ", "make me", "build me",
         ]
         if any(c in text for c in complex_triggers):
+            return "complex"
+
+        # v0.22 (Part L): a compute/memory conjunction is a true TWO-capability
+        # task ('Calculate X and remember the result') — the fast path cannot
+        # carry it (the single-intent net is disabled by the conjunction, and
+        # the live v0.21 eval failed exactly this shape). Send to planner.
+        if re.search(
+            r"\b(calculate|compute)\b.*\band\s+(remember|save|store|note)\b"
+            r"|\b(remember|note|save)\b.*\band\s+(calculate|compute)\b",
+            text,
+        ):
+            return "complex"
+
+        # v0.22 (Part L): two RETRIEVAL capabilities in one request
+        # ('search my documents and compare with the web') need ordered
+        # multi-tool execution — planner territory.
+        if re.search(
+            r"\b(search|find|look\s*up|check)\b[^.!?]*\band\b[^.!?]*"
+            r"\b(compare|contrast|cross-?check)\b"
+            r"|\bcompare\b[^.!?]*\bwith\b[^.!?]*\b(knowledge|document|note|web|search)\b",
+            text,
+        ):
+            return "complex"
+
+        # v0.23: retrieval + memory conjunction ('find what my roadmap says
+        # about X and remember it') is a two-capability task — planner.
+        if re.search(
+            r"\b(search|find|look\s*up|check)\b[^.!?]*\band\s+(remember|save|store|note)\b"
+            r"|\b(remember|save|store|note)\b[^.!?]*\bwhat\b[^.!?]*\b(say|says|said|found|find)\b",
+            text,
+        ):
             return "complex"
 
         # A bare "then" / "next" / "also" as a connecting word usually means
@@ -141,8 +192,14 @@ class Orchestrator:
             "weather",
         ]
         if (
-            any(k in text for k in simple_keywords)
-            and len(text) < 150
+            # v0.22: operator keywords ('+', '-', ...) must not substring-match
+            # inside words — 'plan-and-execute' contains '-' and previously
+            # routed ANY hyphenated text to the fast path. Arithmetic without
+            # operator keywords is still caught by the digit-operator pattern.
+            any(k in text for k in simple_keywords if k not in "+-*/")
+            or re.search(r"\d\s*[-+*/^]\s*\d", text)
+        ) and (
+            len(text) < 150
             and sentence_count <= 2
         ):
             return "simple"
@@ -192,24 +249,73 @@ class Orchestrator:
         log.info("intent_routed", intent=intent, bypassed_planner=(intent == "simple"))
         _emit(on_event, type="intent", intent=intent)
         self._current_mode = "simple" if intent == "simple" else "complex"
+        # v0.23: fresh repeat-semantics ledger for this turn. (Thread-level
+        # isolation is provided by the session lease; the ledger is per-turn
+        # by construction because chat() replaces it at entry.)
+        self._dispatch_ledger = DispatchLedger()
+
+        # v0.21 capability-aware tool policy (kill switch restores v0.20):
+        # the contract block teaches WHEN tools apply; the fast-path safety
+        # net forces one tool round when a single-intent request clearly
+        # needs an obligation capability (calculator / search_knowledge).
+        # Telemetry (tool_policy_applied) records WHY tool rounds were or
+        # were not available, so policy misses are measurable from logs.
+        policy_on = not bool(getattr(settings, "JARVIS_DISABLE_TOOL_POLICY", False))
+        force_tool_round = False
+        forced_tool_name: str | None = None
+        tool_policy_block: str | None = None
+        if policy_on:
+            tool_policy_block = build_tool_policy_block()
+            forced_tool = is_single_intent_obligation(user_input, self._registry)
+            if forced_tool:
+                force_tool_round = True
+                forced_tool_name = forced_tool
+            log.info(
+                "tool_policy_applied",
+                intent=intent,
+                forced_tool=forced_tool,
+                force_tool_round=force_tool_round,
+            )
+            # SSE consumers see this event ONLY when the safety net changes
+            # routing; the decision itself is always in the structured log.
+            if force_tool_round:
+                _emit(
+                    on_event,
+                    type="tool_policy",
+                    forced_tool=forced_tool,
+                    force_tool_round=True,
+                )
+        unmet_note = detect_unmet_capability(user_input, self._registry)
+        # v0.21: which tool the single-intent safety net demands (consumed by
+        # the deterministic calculator fallback in _enforce_min_tool_round).
+        self._forced_tool_name = forced_tool_name
 
         tool_schemas = self._registry.get_schemas()
         request_started = time.perf_counter()
 
         if intent == "simple":
-            messages = self._context.build_messages(
-                system_prompts=[
-                    {"role": "system", "content": settings.system_prompt},
-                    {"role": "system", "content": memory_cue},
-                ],
+            simple_system_prompts = [
+                {"role": "system", "content": settings.system_prompt},
+                {"role": "system", "content": memory_cue},
+            ]
+            if tool_policy_block:
+                simple_system_prompts.append(
+                    {"role": "system", "content": tool_policy_block}
+                )
+            fast_path_messages = self._context.build_messages(
+                system_prompts=simple_system_prompts,
                 history=history,
                 user_input=user_input,
             )
+            if unmet_note:
+                fast_path_messages.append({"role": "system", "content": unmet_note})
+            fast_path_rounds = 2 if not force_tool_round else 3
             final_text, _ = self._run_react(
                 session_id=session_id,
-                messages=messages,
+                messages=fast_path_messages,
                 tool_schemas=tool_schemas,
-                max_rounds=2,
+                max_rounds=fast_path_rounds,
+                min_rounds=1 if force_tool_round else 0,
                 on_event=on_event,
                 pause_context={
                     # Fast-path turns park too: the approved action IS the
@@ -231,12 +337,34 @@ class Orchestrator:
             return final_text
 
         # ── 2. Plan phase ──────────────────────────────────────────────────────
-        plan = self._planner.generate_plan(user_input, context_cue)
+        raw_plan = self._planner.generate_plan(user_input, context_cue)
+        # v0.22 deterministic plan validation (structural only; a plan is a
+        # request, never authorization): shape, bounds, registry truth,
+        # duplicates, dependency ordering, orphan reasoning steps.
+        validation = validate_plan(raw_plan, self._registry.list_tools())
+        plan = validation.plan
+        log.info(
+            "plan_validated",
+            session_id=session_id,
+            raw_steps=len(raw_plan),
+            steps=len(plan),
+            issues=validation.issues,
+        )
+        if not plan:
+            log.warning("plan_rejected_empty", session_id=session_id)
+            return self._synthesize(
+                session_id=session_id,
+                user_input=user_input,
+                memory_cue=memory_cue,
+                history=history,
+                completed_steps=[],
+            )
         log.info(
             "plan_ready",
             session_id=session_id,
             steps=len(plan),
             est_context_tokens=estimate_tokens(history),
+            quality=report_plan_quality(plan, set(self._registry.list_tools())),
             plan=[{
                 "step": s.get("step_number"),
                 "description": s.get("description"),
@@ -256,12 +384,38 @@ class Orchestrator:
         # ── 3. Execute phase ───────────────────────────────────────────────────
         completed_steps: list[dict[str, Any]] = []
         remaining_rounds = MAX_TOOL_ROUNDS
+        # v0.22 (Part E): exact clamped tool evidence carried across steps so
+        # a later step can quote real values, not an earlier step's prose.
+        step_observations: list[str] = []
 
+        completed_descriptions: set[str] = set()
+        failed_step_count = 0
         for step in plan:
             step_number = int(step.get("step_number") or len(completed_steps) + 1)
             description = str(step.get("description") or "").strip()
             if not description:
                 continue
+
+            # v0.23 (Part F): a plan step whose task was already completed by
+            # an earlier step (non-consecutive duplicates survive the
+            # validator's consecutive-dedup) is redundant — record it and
+            # skip execution instead of re-running the same work.
+            desc_key = " ".join(description.lower().split())
+            if desc_key in completed_descriptions:
+                log.info(
+                    "redundant_plan_step",
+                    session_id=session_id,
+                    step=step_number,
+                    duplicate_of=description[:80],
+                )
+                _emit(on_event, type="redundant_step", step_number=step_number)
+                completed_steps.append({
+                    "step_number": step_number,
+                    "description": description,
+                    "result": "(skipped: identical to an earlier completed step)",
+                })
+                continue
+            completed_descriptions.add(desc_key)
 
             log.info(
                 "step_execute_start",
@@ -279,16 +433,30 @@ class Orchestrator:
                 history=history,
                 step_number=step_number,
                 description=description,
-                completed_steps=completed_steps,
+                completed_steps=_clamp_step_results(completed_steps, self._context.clamp_tool_output),
+                unmet_note=unmet_note,
+                observations=list(step_observations),
             )
 
             per_step_budget = min(MAX_TOOL_ROUNDS_PER_STEP, max(0, remaining_rounds))
+            # v0.22 (Parts F/H): a validated step that names required tools
+            # must attempt one tool round — the executor's bounded correction
+            # when the executor model would otherwise answer the step from
+            # memory. (The step's OWN single-intent fallback does not fire
+            # here; the forced recovery round does, and tool errors still
+            # feed the normal self-correction sub-loop.)
             step_result, rounds_used = self._run_react(
                 session_id=session_id,
                 messages=step_messages,
-                tool_schemas=tool_schemas,
+                tool_schemas=narrow_schemas_for_react(
+                    self._registry,
+                    description,
+                    step.get("required_tools") or [],
+                ),
                 max_rounds=per_step_budget,
+                min_rounds=1 if step.get("required_tools") else 0,
                 on_event=on_event,
+                tool_observations=step_observations,
                 pause_context={
                     "original_request": user_input,
                     "memory_cue": memory_cue,
@@ -316,6 +484,24 @@ class Orchestrator:
                 "description": description,
                 "result": step_result,
             })
+            # Part P telemetry: a failed step is visible by state, not guesswork.
+            if _is_tool_error(step_result):
+                failed_step_count += 1
+                log.warning(
+                    "plan_step_failed",
+                    session_id=session_id,
+                    step=step_number,
+                    required_tools=step.get("required_tools") or [],
+                )
+                _emit(on_event, type="step_failed", step_number=step_number)
+            else:
+                # Part F/P telemetry: the step satisfied its requirement.
+                log.info(
+                    "plan_step_satisfied",
+                    session_id=session_id,
+                    step=step_number,
+                    required_tools=step.get("required_tools") or [],
+                )
             log.info(
                 "step_execute_done",
                 session_id=session_id,
@@ -613,6 +799,14 @@ class Orchestrator:
             session_id, limit=settings.max_context_messages * 3
         )
         tool_schemas = self._registry.get_schemas()
+        # v0.22 (Part E): rebuild the observation ledger from completed steps'
+        # tool messages (persisted in the store) so resumed steps keep the
+        # same exact-evidence flow as a non-paused turn.
+        step_observations: list[str] = [
+            self._context.clamp_tool_output(str(m.get("content") or ""))
+            for m in history
+            if m.get("role") == "tool" and not _is_tool_error(str(m.get("content") or ""))
+        ]
 
         # The paused step's outcome (approval result, denial, or tool error)
         # becomes a completed step so synthesis and later steps can use it.
@@ -662,7 +856,8 @@ class Orchestrator:
                 history=history,
                 step_number=step_number,
                 description=description,
-                completed_steps=completed_steps,
+                completed_steps=_clamp_step_results(completed_steps, self._context.clamp_tool_output),
+                observations=list(step_observations),
             )
             per_step_budget = min(MAX_TOOL_ROUNDS_PER_STEP, max(0, remaining_rounds))
             step_result, rounds_used = self._run_react(
@@ -670,6 +865,7 @@ class Orchestrator:
                 messages=step_messages,
                 tool_schemas=tool_schemas,
                 max_rounds=per_step_budget,
+                min_rounds=1 if step.get("required_tools") else 0,
                 # Nested pauses during resumed steps re-park with fresh state.
                 pause_context={
                     "original_request": original_request,
@@ -680,6 +876,7 @@ class Orchestrator:
                     "remaining_rounds": remaining_rounds,
                     "mode": mode,
                 },
+                tool_observations=step_observations,
             )
             if step_result == PAUSED_FOR_CONFIRMATION:
                 log.info("turn_paused_again_during_resume", session_id=session_id, step=step_number)
@@ -726,13 +923,18 @@ class Orchestrator:
         step_number: int,
         description: str,
         completed_steps: list[dict[str, Any]],
+        unmet_note: str | None = None,
+        observations: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Focused message list for one plan step."""
         prior = _format_completed_steps(completed_steps)
         step_brief = (
             f"You are executing step {step_number} of a multi-step plan.\n"
             f"Step description: {description}\n\n"
-            "Complete ONLY this step. Use tools if needed. "
+            "Complete ONLY this step. "
+            "If the step needs a capability JARVIS has a tool for (search, "
+            "calculation, memory, files, web), the tool call is REQUIRED — "
+            "do the step by tool, not from memory. "
             "When done, reply with a concise result for this step. "
             "Do not start the next step; do not answer the overall request yet."
         )
@@ -751,6 +953,19 @@ class Orchestrator:
                 "role": "system",
                 "content": f"Results from previously completed steps:\n{prior}",
             })
+        if observations:
+            # v0.22 (Part E): exact, clamped tool evidence from earlier steps —
+            # a later step must not depend on the verbosity of an earlier
+            # step's prose summary. Identity preserved: each line names its
+            # source step. ContextManager remains the size boundary (the
+            # observation lines are already clamp_tool_output-bounded).
+            messages.append({
+                "role": "system",
+                "content": "Exact tool results from earlier steps (quote values from here):\n"
+                + "\n".join(observations),
+            })
+        if unmet_note:
+            messages.append({"role": "system", "content": unmet_note})
         return messages
 
     def _run_react(
@@ -760,11 +975,18 @@ class Orchestrator:
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]],
         max_rounds: int,
+        min_rounds: int = 0,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         pause_context: dict[str, Any] | None = None,
+        tool_observations: list[str] | None = None,
     ) -> tuple[str, int]:
         """
         Mini ReAct loop for a single plan step.
+
+        v0.22: when ``tool_observations`` is a list, every clamped raw tool
+        result is appended to it so the CALLER can propagate exact evidence
+        to later steps (a later step must not depend on how verbosely the
+        model summarized an earlier step).
 
         Includes a self-correction sub-loop: when a tool returns an error, the
         loop feeds the observation back to the LLM and grants up to
@@ -804,7 +1026,32 @@ class Orchestrator:
 
             if not tool_calls:
                 # LLM chose to answer directly (possibly after recovering from an error)
+                if rounds_used < max(0, min_rounds):
+                    # v0.21 fast-path safety net: the caller guaranteed a tool
+                    # round but the model answered without any tool. One
+                    # bounded recovery attempt before accepting the answer.
+                    log.warning(
+                        "forced_tool_round_unfulfilled",
+                        session_id=session_id,
+                        min_rounds=min_rounds,
+                    )
+                    return self._enforce_min_tool_round_sync(
+                        session_id=session_id,
+                        messages=messages,
+                        tool_schemas=tool_schemas,
+                        rounds_used=rounds_used,
+                        pause_context=pause_context,
+                    )
                 self._store.save_message(session_id, assistant_dict)
+                # Part P telemetry: record WHY no tool ran this turn (the
+                # model chose a direct answer) so fast-path policy misses
+                # are measurable without reading raw model output.
+                log.info(
+                    "no_tool_direct_answer",
+                    session_id=session_id,
+                    round=round_num + 1,
+                    forced_round_pending=bool(min_rounds),
+                )
                 return (assistant_message.content or ""), rounds_used
 
             rounds_used += 1
@@ -877,6 +1124,9 @@ class Orchestrator:
                     "content": active_content,
                 }
                 messages.append(active_tool_result_message)
+                # v0.22: raw evidence for later steps (bounded by the clamp).
+                if tool_observations is not None:
+                    tool_observations.append(str(active_content))
 
             # ── Pause propagation ────────────────────────────────────────────────
             if paused:
@@ -920,6 +1170,19 @@ class Orchestrator:
                 consecutive_errors = 0  # successful round; reset error counter
 
         # Step budget (including correction rounds) exhausted — force a wrap-up.
+        if rounds_used < max(0, min_rounds):
+            log.warning(
+                "forced_tool_round_unfulfilled",
+                session_id=session_id,
+                min_rounds=min_rounds,
+            )
+            return self._enforce_min_tool_round_sync(
+                session_id=session_id,
+                messages=messages,
+                tool_schemas=tool_schemas,
+                rounds_used=rounds_used,
+                pause_context=pause_context,
+            )
         log.warning("max_tool_rounds_exceeded", session_id=session_id, phase="step")
         final_response = chat_completion(messages=messages, tools=None)
         final_message = final_response.choices[0].message
@@ -982,6 +1245,138 @@ class Orchestrator:
             return decision
         return self._registry.dispatch(tool_name, tool_args)
 
+    def _enforce_min_tool_round_sync(
+        self,
+        *,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        rounds_used: int,
+        pause_context: dict[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        """Sync bridge for _enforce_min_tool_round from the sync _run_react.
+
+        Uses the same running-loop fallback as the tool-dispatch block:
+        a fresh event loop when none is running, a worker thread otherwise.
+        """
+        import asyncio
+        import concurrent.futures
+
+        enforcement = self._enforce_min_tool_round(
+            session_id=session_id,
+            messages=messages,
+            tool_schemas=tool_schemas,
+            rounds_used=rounds_used,
+            pause_context=pause_context,
+        )
+        try:
+            asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                return pool.submit(asyncio.run, enforcement).result()
+        except RuntimeError:
+            return asyncio.run(enforcement)
+
+    async def _enforce_min_tool_round(
+        self,
+        *,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        rounds_used: int,
+        pause_context: dict[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        """
+        v0.21 fast-path safety net (bounded): give the model ONE tool-enabled
+        recovery call after it tried to answer without the guaranteed tool
+        round. If it now emits tool calls, dispatch them (PermissionGuard +
+        registry validation, same as the normal loop) and produce a grounded
+        answer; otherwise its direct answer stands. Never retries twice.
+        """
+        forced_observation = (
+            "FORCED-TOOL-ROUND NOTE: this request needs a tool attempt. If a "
+            "suitable tool exists for it, call it now; otherwise answer and "
+            "state plainly why no tool applied."
+        )
+        messages.append({"role": "system", "content": forced_observation})
+        response = chat_completion(messages=messages, tools=tool_schemas)
+        message = response.choices[0].message
+        message_dict = _message_to_dict(message)
+        self._store.save_message(session_id, message_dict)
+        calls = getattr(message, "tool_calls", None)
+        if not calls:
+            # v0.21 deterministic fallback (calculator only, bounded): when a
+            # single-intent arithmetic request went through the whole prompt
+            # surface without a single calculator attempt, the system executes
+            # the extraction-validated expression ITSELF instead of accepting
+            # an ungrounded (and often wrong) mental-arithmetic answer.
+            # Authorization unchanged: PermissionGuard still guards the tool,
+            # schema validation still applies, and this NEVER fires when the
+            # model attempted the tool (rounds_used > 0) or for non-forced
+            # requests. Knowledge stays model-driven (no deterministic path).
+            if (
+                rounds_used == 0
+                and self._forced_tool_name == "calculator"
+                and "calculator" in self._registry.list_tools()
+            ):
+                expression = extract_arithmetic(_user_request_from_messages(messages))
+                if expression:
+                    log.info(
+                        "deterministic_tool_fallback",
+                        tool="calculator",
+                        reason="model_emitted_no_tool_call",
+                    )
+                    result = await self._dispatch_with_permissions_async(
+                        session_id,
+                        "calculator",
+                        json.dumps({"expression": expression}),
+                        f"fallback_{uuid.uuid4().hex[:8]}",
+                        pause_context=pause_context,
+                    )
+                    if result != PAUSED_FOR_CONFIRMATION and not _is_tool_error(result):
+                        fallback_note = {
+                            "role": "system",
+                            "content": (
+                                f"TOOL RESULT (executed by JARVIS after the model "
+                                f"failed to call the calculator): calculator({expression!r}) "
+                                f"-> {result}. Use this exact value in your answer; "
+                                "do not recompute or contradict it."
+                            ),
+                        }
+                        messages.append(fallback_note)
+                        answer = chat_completion(messages=messages, tools=None)
+                        answer_message = answer.choices[0].message
+                        self._store.save_message(session_id, _message_to_dict(answer_message))
+                        return (answer_message.content or ""), 1
+            return (message.content or ""), rounds_used
+
+        messages.append(message_dict)
+        for tc in calls:
+            result = await self._dispatch_with_permissions_async(
+                session_id,
+                tc.function.name,
+                tc.function.arguments,
+                tc.id,
+                pause_context=pause_context,
+            )
+            if result == PAUSED_FOR_CONFIRMATION:
+                # The action needs approval; surface it like any other pause
+                # so the durable resume machinery takes over.
+                return PAUSED_FOR_CONFIRMATION, rounds_used + 1
+            tool_msg: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "name": tc.function.name,
+                "content": result,
+            }
+            self._store.save_message(session_id, tool_msg)
+            messages.append(
+                {**tool_msg, "content": self._context.clamp_tool_output(result)}
+            )
+        answer = chat_completion(messages=messages, tools=None)
+        answer_message = answer.choices[0].message
+        self._store.save_message(session_id, _message_to_dict(answer_message))
+        return (answer_message.content or ""), rounds_used + 1
+
     async def _dispatch_with_permissions_async(
         self,
         session_id: str,
@@ -989,6 +1384,7 @@ class Orchestrator:
         tool_args: str,
         tool_call_id: str,
         pause_context: dict[str, Any] | None = None,
+        intentional_repeat: bool = False,
     ) -> str:
         """
         Run PermissionGuard checks, then registry dispatch asynchronously.
@@ -996,6 +1392,15 @@ class Orchestrator:
         When the guard parks a confirmation, ``pause_context`` (the durable
         resume state) is persisted alongside it so the turn can CONTINUE
         after the user resolves the action — even across a restart.
+
+        v0.23 (Part E): an identical (tool, canonical-args) dispatch that
+        ALREADY succeeded this turn is suppressed — the step receives the
+        previous result via the caller's message history, so no observation
+        is lost (Part N) and no external side effect runs twice. This is
+        NOT an authorization change: the guard runs first, and suppression
+        never marks anything approved. Failed results are never recorded,
+        so retry-after-failure remains legitimate (Part K); state-dependent
+        tools are exempt by class.
         """
         risk_level = self._registry.get_tool_risk_level(tool_name)
 
@@ -1034,7 +1439,21 @@ class Orchestrator:
                 f"(Risk Level: {risk_level})."
             )
 
-        return await self._registry.dispatch_async(tool_name, tool_args)
+        # v0.23 repeat semantics (AFTER the guard: suppression is never an
+        # authorization path). deliberate repeats (recovery rounds) and
+        # state-dependent tools pass through untouched.
+        if not intentional_repeat and self._dispatch_ledger.is_duplicate(tool_name, tool_args):
+            self._dispatch_ledger.record_suppressed(tool_name, tool_args)
+            return (
+                "DUPLICATE_SUPPRESSED: this exact tool call already succeeded "
+                "earlier in this task and its full result is present above. "
+                "Do not repeat it; use the existing result to continue."
+            )
+
+        result = await self._registry.dispatch_async(tool_name, tool_args)
+        if not _is_tool_error(result):
+            self._dispatch_ledger.record_success(tool_name, tool_args)
+        return result
 
     def _synthesize(
         self,
@@ -1047,11 +1466,9 @@ class Orchestrator:
     ) -> str:
         """Final tool-free call that turns step results into the user answer."""
         # Step results can embed huge tool outputs; clamp them so the final
-        # synthesis call cannot blow up the context window either.
-        clamped_steps = [
-            {**step, "result": self._context.clamp_tool_output(str(step.get("result") or ""))}
-            for step in completed_steps
-        ]
+        # synthesis call cannot blow up the context window either (v0.22:
+        # shared with the per-step injection via _clamp_step_results).
+        clamped_steps = _clamp_step_results(completed_steps, self._context.clamp_tool_output)
         steps_blob = _format_completed_steps(clamped_steps) or "(no steps completed)"
         messages: list[dict[str, Any]] = self._context.build_messages(
             system_prompts=[
@@ -1147,6 +1564,32 @@ def _message_to_dict(message: Any) -> dict[str, Any]:
         ]
 
     return d
+
+
+def _clamp_step_results(
+    completed_steps: list[dict[str, Any]], clamp: Any
+) -> list[dict[str, Any]]:
+    """v0.22 (Part E): clamp each step result for prompt injection.
+
+    The DB keeps the full result; the PROMPT copy is bounded so one huge
+    tool output (scrape, dump) cannot consume the context for later steps
+    or for synthesis. Identity (step number/description) is preserved.
+    """
+    return [
+        {
+            **step,
+            "result": clamp(str(step.get("result") or "")),
+        }
+        for step in completed_steps
+    ]
+
+
+def _user_request_from_messages(messages: list[dict[str, Any]]) -> str:
+    """Return the latest user message text (the current request)."""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
 
 
 def _is_tool_error(result: str) -> bool:

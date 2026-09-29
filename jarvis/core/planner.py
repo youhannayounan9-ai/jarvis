@@ -26,17 +26,21 @@ PLANNER_SYSTEM_PROMPT = (
     "1. Prefer the FEWEST steps that fully cover the request (1-3 is typical; "
     "   never invent busywork steps like 'understand' or 'synthesize').\n"
     "2. Each step must be independently executable and build toward the final answer.\n"
-    "3. 'required_tools' must contain ONLY tool names that exist in the provided "
-    "   tool list; use [] for a pure-reasoning step.\n"
-    "4. Steps that do not depend on earlier results are fine to list in any order; "
-    "   the executor runs them sequentially and the executor, not you, decides "
-    "   the concrete tool arguments.\n"
+    "3. 'required_tools' must contain ONLY tool names from the catalogue below; "
+    "   use [] for a pure-reasoning step.\n"
+    "4. ORDER STEPS SO DEPENDENCIES WORK: a step that needs a value (e.g. a "
+    "   calculation result, a search finding) must come AFTER the step that "
+    "   produces it, and its description must say what it does with the prior "
+    "   result ('remember the calculated result').\n"
     "5. If the request mentions memory of the user ('my', 'remember', personal "
     "   facts), include the recall_facts / remember_fact tools as required.\n"
     "6. Resolve references to earlier results ('it', 'that page', 'the result') "
     "   into each step's own description: every step must be self-contained, "
     "   because the executor sees prior results but re-reads each description cold.\n"
-    "7. Return ONLY a valid JSON array of objects, where each object has "
+    "7. When a step's capability needs current data (web, date/time, user "
+    "   documents, personal memory) its required_tools MUST name the matching "
+    "   catalogue tool — never rely on answering from memory.\n"
+    "8. Return ONLY a valid JSON array of objects, where each object has "
     "   'step_number' (int), 'description' (str), and 'required_tools' (list of str). "
     "   No markdown fences, no prose outside the JSON array."
 )
@@ -56,9 +60,17 @@ class Planner:
         llm_client: Callable with the same signature as ``chat_completion``.
     """
 
-    def __init__(self, llm_client: LLMClient, tool_names: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        tool_names: list[str] | None = None,
+        tool_descriptions: dict[str, str] | None = None,
+    ) -> None:
         self._llm = llm_client
         self._tool_names = list(tool_names) if tool_names else []
+        # v0.22: compact catalogue (name -> description) so the planner can
+        # choose tools by CAPABILITY, not by guessing from bare names.
+        self._tool_descriptions = dict(tool_descriptions) if tool_descriptions else {}
 
     def generate_plan(self, user_input: str, context: str) -> list[dict[str, Any]]:
         """
@@ -78,7 +90,10 @@ class Planner:
             {
                 "role": "user",
                 "content": build_planner_user_prompt(
-                    user_input, context, self._tool_names
+                    user_input,
+                    context,
+                    self._tool_names,
+                    self._tool_descriptions,
                 ),
             },
         ]
@@ -169,13 +184,21 @@ def build_planner_user_prompt(
     user_input: str,
     context: str,
     tool_names: list[str] | None = None,
+    tool_descriptions: dict[str, str] | None = None,
 ) -> str:
     """
-    Compose the planner's user message, optionally grounding it in the
-    actual registered tool names so 'required_tools' stays truthful.
+    Compose the planner's user message.
+
+    v0.22: when tool descriptions are provided, ground the planner in a
+    compact capability catalogue (name + description) instead of bare names,
+    so 'required_tools' reflects what each tool actually DOES.
     """
     tool_block = ""
-    if tool_names:
+    if tool_descriptions:
+        tool_block = "Tool catalogue (name: what it does):\n" + "\n".join(
+            f"- {name}: {desc}" for name, desc in tool_descriptions.items()
+        ) + "\n\n"
+    elif tool_names:
         tool_block = "Available tools:\n" + "\n".join(f"- {t}" for t in tool_names) + "\n\n"
     return (
         f"Context:\n{context or '(none)'}\n\n"

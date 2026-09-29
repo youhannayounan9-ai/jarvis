@@ -1304,7 +1304,7 @@ wheels = [
 
 [[package]]
 name = "jarvis"
-version = "0.20.0"
+version = "0.23.0"
 source = { editable = "." }
 dependencies = [
     { name = "cachetools" },

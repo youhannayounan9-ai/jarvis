@@ -367,6 +367,64 @@ The Streamlit dashboard gained a **📚 Knowledge** view: indexed documents, exp
 
 ---
 
+## 8c. How JARVIS Decides When to Use Tools (v0.21)
+
+JARVIS does not just dump every tool into the model and hope. Every request first passes a **capability classification** (zero-latency, no LLM call) that asks: does this need **no tool**, a **specific known capability** (calculation, knowledge retrieval, web, memory, files, vision, datetime), or **multiple steps**? The result decides the execution path:
+
+- **Simple requests** ("What is 893 × 47?", "What does my AI roadmap say about LangGraph?") take the fast path, with the tool-selection contract added to the prompt. For clear single-intent **arithmetic** or **knowledge** asks, a safety net requires one tool round — the model may not silently substitute mental arithmetic or pretend it read your documents.
+- **Multi-step requests** go to the planner; each planned step now states that tool-backed capabilities must actually use the tool.
+- **If the model still refuses the calculator** on a plain arithmetic request, JARVIS runs the calculator itself (same permission checks, same validation), gives the exact result to the model, and lets it phrase the answer — you get the correct number instead of a confidently wrong one. This is deliberately calculator-only: knowledge retrieval stays model-driven.
+- **Unavailable capabilities are refused honestly** (v0.16 rule, unchanged): asking it to run Python or control the computer yields a plain "I can't do that", never a pretended attempt — even when the request contains numbers like `print(2+2)`.
+- **No-tool questions** ("Explain gradient descent") should answer directly. Small local models occasionally still reach for a tool on such questions — that residual variance is a model limitation, documented in the developer manual.
+
+The result on the reference model (qwen2.5:7b, live A/B): correct tool selection rose from 69% to 81% of focused evaluation cases, with zero fabricated tool names. Date questions route to the calendar (not the calculator), "what does MY document say" reliably enters the knowledge-retrieval path, and every routing decision is visible in the logs (`tool_policy_applied`, `deterministic_tool_fallback`, `no_tool_direct_answer`).
+
+---
+
+## 8d. Multi-Step Tasks (v0.22)
+
+When you ask for something with several parts — "Calculate 893 × 47 and remember the result" — JARVIS plans before it acts:
+
+```
+calculate          ↓                ↓
+remember the result   ↓                ↓
+answer with the real number
+```
+
+What v0.22 guarantees:
+
+- **The planner sees what tools do.** Plans are built from a compact catalogue of your actual tools (purpose per tool), so steps name real capabilities — and any hallucinated tool name is removed before execution.
+- **Plans are validated.** Step count, required fields, duplicate steps, and impossible dependencies ("use the result of step 4" in step 2) are caught deterministically before anything runs.
+- **Results flow between steps.** Each step sees the exact (size-bounded) tool results of earlier steps — the memory step stores the calculator's actual number, not a paraphrase of it.
+- **Tool steps use tools.** A step that names a required tool must attempt it; the executor may not quietly answer from memory.
+- **Corrections stay bounded.** A failed tool call feeds one recovery round; a scripted-failure live test showed the agent recovering and completing the task.
+- **Every execution still passes the same permission checks** — planning never authorizes anything.
+
+Honest limits: the local 7B model still over-plans tools for pure-explanation questions occasionally; exact multi-step tool ordering is currently at ~0.6 of focused live runs (all *required* tools run in 1.0, order variance comes from extra calls — and since v0.23, redundant extra calls are usually suppressed before they run, see §8e). Single-capability tasks remain more reliable than chained ones.
+
+---
+
+## 8e. Repeated Work & Knowing When to Stop (v0.23)
+
+**Why did JARVIS used to repeat itself?** A small local model drives every decision, and when a step doesn't produce the phrasing it hoped for, its instinct is to try the same tool again — identical search, identical query. That wastes time and clutters the answer.
+
+**What stops it now:** within a single conversation turn, JARVIS remembers every tool call that **succeeded** — by tool *and* exact arguments, not just tool name. If the model emits the very same call again, JARVIS blocks it before it runs and tells the model: *that result is already above — use it.* So "search the web for X, then search the web for X again" runs one real search.
+
+**What still repeats — on purpose:**
+
+- **Different arguments are different work.** Searching for LangGraph *then* for checkpointing runs both searches; only identical argument repeats are blocked.
+- **A failed call can be retried.** Only *successful* calls are remembered, so a transient error never locks the tool away.
+- **Genuinely fresh information is exempt.** The clock and your memory (`get_current_datetime`, `recall_facts`, `remember_fact`) may legitimately be asked twice — the answer can change or matter twice. Web and knowledge searches are *not* exempt: an external page doesn't change between two identical searches seconds apart.
+- **New turn, clean slate.** The ledger lives for one turn only; asking the same thing tomorrow really searches again.
+
+**Redundant plan steps** are skipped too: if the plan contains two steps described identically, the second is marked *skipped: identical to an earlier completed step* instead of re-running.
+
+**How completion is known:** every plan step must either produce its required tool evidence or legitimately not need one; JARVIS logs which steps were completed, failed, or skipped, and only synthesizes the final answer once the plan is done (or its failure budget is spent). The Dashboard's Operations page shows the same picture per session: executions, successes, failures, and a repeated-tool warning that notes repeats may be legitimate or suppressed.
+
+Honest limits: suppression matches *exact arguments* — `"2+2"` and `"2 + 2"` are different strings and fingerprint differently; the model re-running a search with reworded arguments is doing different (legitimate) work by this rule.
+
+---
+
 ## 9. Streamlit Dashboard
 
 ```bash

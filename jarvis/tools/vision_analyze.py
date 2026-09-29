@@ -21,8 +21,15 @@ log = get_logger(__name__)
 class VisionAnalyzeTool(BaseTool):
     name = "vision_analyze"
     description = (
-        "CRITICAL: Use this to analyze an image, screenshot, or photo. "
-        "You MUST provide the absolute file path to the image."
+        "Analyze an image (photo, screenshot, diagram) with a local vision "
+        "model. "
+        "PURPOSE: see what is in an image file. "
+        "WHEN TO USE: the user provides an image path or asks to analyze a "
+        "screenshot/photo. WHEN NOT TO USE: text-only questions, documents "
+        "already in the knowledge base (search_knowledge), or image paths "
+        "outside the sandbox (refused). "
+        "INPUT: absolute image file path. OUTPUT: a detailed description of "
+        "the image or an ERROR string."
     )
     parameters = {
         "type": "object",

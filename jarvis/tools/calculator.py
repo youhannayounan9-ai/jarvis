@@ -79,9 +79,17 @@ def safe_math_eval(expr: str) -> float | int:
 class CalculatorTool(BaseTool):
     name = "calculator"
     description = (
-        "Evaluate a mathematical expression safely. "
-        "Supports +, -, *, /, **, and parentheses. "
-        "ONLY use this tool for exact calculations you cannot answer yourself."
+        "Compute the EXACT result of one arithmetic expression. "
+        "PURPOSE: precise arithmetic (+, -, *, /, **, parentheses). "
+        "WHEN TO USE: whenever the answer requires calculating with numbers "
+        "in the request or derived from it — sums, products, quotients, "
+        "percentages, unit or day-count spans — even when the math looks "
+        "easy, because mental arithmetic produces wrong answers. "
+        "WHEN NOT TO USE: conceptual math questions (definitions, proofs, "
+        "estimates, explanations) that do not ask for an exact value. "
+        "INPUT: one expression, e.g. '12 * (4 + 3) / 2.5'. "
+        "OUTPUT: 'Result: <number>' or an ERROR string (invalid syntax, "
+        "division by zero, exponent too large)."
     )
     parameters = {
         "type": "object",

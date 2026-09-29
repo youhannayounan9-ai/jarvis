@@ -18,10 +18,16 @@ log = get_logger(__name__)
 class WriteFileTool(BaseTool):
     name = "write_file"
     description = (
-        "CRITICAL: Use this to write or append text to a file. "
-        "You MUST provide a valid filename and content. "
-        "If you do not call this tool, the file is NOT written and you must "
-        "never claim to have written, saved, or deleted it."
+        "Create or append text to a file inside the allowed sandbox directory. "
+        "PURPOSE: durable file writes the user asked for. "
+        "WHEN TO USE: the user asks to save/write/create a file with given or "
+        "derived content. "
+        "WHEN NOT TO USE: unspecified write targets, content you cannot derive "
+        "from tool results, or paths outside the sandbox (refused). "
+        "If you did not call this tool, the file was NOT written — never claim "
+        "a write happened without this tool's success result. "
+        "INPUT: file_path + content (+ append=true to append). OUTPUT: a "
+        "success line or an ERROR string."
     )
     parameters = {
         "type": "object",

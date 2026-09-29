@@ -15,9 +15,15 @@ from jarvis.tools.base import BaseTool
 class GetCurrentDatetimeTool(BaseTool):
     name = "get_current_datetime"
     description = (
-        "Returns the current local date, time, day of the week, and UTC offset. "
-        "ONLY call this tool when the user explicitly asks what time or date it is. "
-        "Do NOT call this for any other type of question."
+        "Get the current local date, time, day of the week, and UTC offset. "
+        "PURPOSE: anchor 'now' for any time-dependent reasoning. "
+        "WHEN TO USE: the user asks for the current time/date, or a request "
+        "depends on it ('today', 'tomorrow', 'next week', deadlines, ages, "
+        "countdowns — pair with calculator for spans). "
+        "WHEN NOT TO USE: purely historical or arithmetic date questions that "
+        "give all dates explicitly and need no anchor. "
+        "INPUT: none. OUTPUT: one line like 'Current datetime: Monday, "
+        "January 05, 2026 at 14:03:11 (UTC+0100)'."
     )
     parameters = {
         "type": "object",

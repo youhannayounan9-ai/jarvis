@@ -16,10 +16,15 @@ log = get_logger(__name__)
 class RememberFactTool(BaseTool):
     name = "remember_fact"
     description = (
-        "CRITICAL: You MUST use this tool whenever the user states a personal "
-        "fact, name, preference, or ongoing project. "
-        "Do not just say you remembered it in text; "
-        "you MUST call this tool to actually save it to the database."
+        "Persist one fact about the user to long-term memory. "
+        "PURPOSE: make personal facts survive beyond this conversation. "
+        "WHEN TO USE: the user states something about themselves worth keeping "
+        "(name, preferences, projects, deadlines) — acknowledging in text does "
+        "NOT store it. "
+        "WHEN NOT TO USE: facts about the world, document contents, or "
+        "transient chat context. "
+        "INPUT: one concise fact. OUTPUT: a 'Remembered: …' confirmation or an "
+        "ERROR string; never claim a fact was saved without this tool's result."
     )
     parameters = {
         "type": "object",

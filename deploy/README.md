@@ -252,6 +252,49 @@ security control, not an optimization:
   `step_execute_start/done`) — aggregate with any JSON log shipper.
 - `cleanup_old_sessions(max_age_days=30)` exists on the store; schedule it
   (cron/OS task) — the service does not do background jobs itself.
+- **Tool-selection policy (v0.21)** — on by default; `JARVIS_DISABLE_TOOL_POLICY=true`
+  restores exact v0.20 behavior. New log events to ship alongside
+  `plan_ready`/`step_execute_*`: `tool_policy_applied` (forced_tool /
+  force_tool_round per turn), `no_tool_direct_answer` (model chose no tool),
+  `forced_tool_round_unfulfilled` (the safety net fired its one recovery
+  round), `deterministic_tool_fallback` (JARVIS executed the calculator
+  itself after a zero-tool-turn on plain arithmetic — same PermissionGuard
+  and schema validation as model-initiated calls). These answer "why did
+  JARVIS call / not call tool X?" from logs alone. The deterministic
+  tool-selection benchmark (`evaluation/tool_selection_benchmark.py`, 27
+  cases / 13 categories) is pytest-wired and runs offline in CI; the live
+  A/B harness (`live_tool_eval.py`) is manual-only and must NEVER run
+  against a shared production Ollama instance unattended.
+- **Multi-step planning (v0.22)** — new log events to ship:
+  `plan_validated` (raw_steps / steps / issues[] — issues list every
+  structural problem found: unknown tools, duplicates, forward references),
+  `plan_step_failed` (step + required_tools), and the existing
+  `plan_ready`/`step_execute_*`. Plans are validated structurally before
+  execution (shape, bounds, registry truth, duplicates, forward-reference
+  rejection) but validation is NOT authorization — every step execution
+  still flows through PermissionGuard, schema validation, and the action
+  ledger. The deterministic multi-step benchmark
+  (`evaluation/multistep_benchmark.py`, 7 cases) is pytest-wired and runs
+  offline in CI; the live multi-step harness (`live_multistep_eval.py`)
+  is manual-only with the same precautions as `live_tool_eval.py`.
+- **Repeat semantics (v0.23)** — new log events to ship alongside the
+  plan events: `duplicate_tool_call_suppressed` (tool + fingerprint only,
+  never arguments — fired when an identical successful call repeats within
+  one turn; see `jarvis/core/dispatch_guard.py`), `plan_step_satisfied`
+  (step + required_tools — the step met its evidence requirement),
+  `redundant_plan_step` (an identical later step was skipped), and
+  `plan_completed` (planned/completed/failed steps, suppressed duplicates,
+  complete=bool — the one-line "did the plan actually finish?" signal).
+  `plan_ready` now also carries `quality=` — a deterministic plan-quality
+  block (steps, toolless steps, unique/repeated tools, forward references,
+  duplicate steps, estimated LLM calls, issues) from
+  `jarvis/core/plan_quality.py`; alert on high `estimated_llm_calls` or
+  repeated-tool issues if you care about efficiency. Suppression is
+  per-turn and success-only by design: failed calls are never recorded
+  (retry works), state-coupled tools (`get_current_datetime`,
+  `recall_facts`, `remember_fact`) are exempt, and the ledger is fresh
+  every turn. The benchmark is now 11 cases with a repeat_semantics
+  category; the live harness reports per-case suppression counts.
 - **Maintenance CLI (v0.18/v0.19)** — schedule `python -m jarvis.maintenance
   doctor` (exit code 0/1 by check results) and alert on non-zero. For
   recovery: `actions --state UNKNOWN`, `unknown-actions`, `sessions

@@ -16,9 +16,17 @@ log = get_logger(__name__)
 class RecallFactsTool(BaseTool):
     name = "recall_facts"
     description = (
-        "CRITICAL: You MUST use this tool whenever the user asks a question "
-        "about themselves, their preferences, or past conversations. "
-        "Do not guess or hallucinate; search the database first."
+        "Search the user's personal long-term memory for facts about them. "
+        "PURPOSE: recall what the user told you before (preferences, name, "
+        "projects, plans). "
+        "WHEN TO USE: before answering ANY question about the user personally "
+        "('my favorite…', 'what is my name', 'what did I say about…') — "
+        "never guess personal facts. "
+        "WHEN NOT TO USE: content of the user's documents (search_knowledge), "
+        "general world knowledge, or things already stated in this "
+        "conversation. "
+        "INPUT: short search query. OUTPUT: formatted memory matches, a "
+        "no-results notice, or an ERROR string — report a miss honestly."
     )
     parameters = {
         "type": "object",

@@ -88,7 +88,7 @@ log = get_logger(__name__)
 app = FastAPI(
     title="JARVIS API",
     description="Local-first AI assistant — agent runtime over HTTP.",
-    version="0.20.0",
+    version="0.23.0",
 )
 
 # ── Runtime dependency (overridable in tests) ─────────────────────────────────

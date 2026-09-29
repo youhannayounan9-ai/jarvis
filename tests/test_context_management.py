@@ -154,8 +154,10 @@ def test_context_window_never_grows_unbounded():
     # Every LLM call must stay under a sane bound regardless of session length
     for call in mock_llm.call_args_list:
         msgs = call[1]["messages"]
-        # system prompts (2) + anchor + summary + window + current user input
-        assert len(msgs) <= 2 + 2 + orchestrator._context.max_messages + 1
+        # system prompts (2) + anchor + summary + window + tool-policy block +
+        # current user input. The v0.21 policy block is a single fixed system
+        # message per call (never per round), so the bound stays constant.
+        assert len(msgs) <= 2 + 2 + orchestrator._context.max_messages + 2
 
 
 def test_route_intent_classification():

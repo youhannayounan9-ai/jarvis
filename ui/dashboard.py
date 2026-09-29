@@ -312,7 +312,7 @@ def _render_ops(backend: Any, current_session: str) -> None:
 
     section = st.radio(
         "Section",
-        ["Recent actions", "UNKNOWN actions", "Session leases", "Session timeline"],
+        ["Recent actions", "UNKNOWN actions", "Session leases", "Session timeline", "Plan status"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -468,7 +468,7 @@ def _render_ops(backend: Any, current_session: str) -> None:
                     )
 
     # ── Session timeline ──────────────────────────────────────────────────
-    else:
+    elif section == "Session timeline":
         sid = st.text_input(
             "Session ID",
             value=current_session,
@@ -508,6 +508,59 @@ def _render_ops(backend: Any, current_session: str) -> None:
                             detail = f"owner={e.get('owner')} active={e.get('active')}"
                         st.markdown(f"{icons.get(kind, '•')} `{ts}` **{kind}** — {detail}")
                     st.caption(f"{len(events)} events (bounded). Safe metadata only.")
+
+    # ── Plan status (v0.23) ──────────────────────────────────────────────
+    elif section == "Plan status":
+        """Minimal plan/repeat indicators for the current session.
+
+        Derived read-only from the session timeline: completed plan steps,
+        failed steps, suppressed duplicate dispatches, and tool usage
+        counts (repeat visibility). Safe metadata only — no tool arguments,
+        no result bodies.
+        """
+        sid = st.text_input(
+            "Session ID",
+            value=current_session,
+            key="plan_status_session",
+            help="Defaults to the active chat session.",
+        )
+        if sid.strip():
+            events, err = _safe(
+                lambda: backend.session_timeline(sid.strip(), 200),
+                "loading plan status",
+            )
+            if err is None and events is not None:
+                tool_counts: dict[str, int] = {}
+                failed_actions = 0
+                succeeded_actions = 0
+                for e in events:
+                    if e.get("kind") == "action_state":
+                        tool = str(e.get("tool") or "?")
+                        tool_counts[tool] = tool_counts.get(tool, 0) + 1
+                        if e.get("state") == "FAILED":
+                            failed_actions += 1
+                        elif e.get("state") == "SUCCEEDED":
+                            succeeded_actions += 1
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Tool executions", succeeded_actions + failed_actions)
+                c2.metric("Succeeded", succeeded_actions)
+                c3.metric("Failed", failed_actions)
+                repeats = {t: n for t, n in sorted(tool_counts.items()) if n > 1}
+                if repeats:
+                    st.warning(
+                        "Tools used more than once in this session: "
+                        + ", ".join(f"{t} ×{n}" for t, n in repeats.items())
+                        + " — repeats may be legitimate (different arguments) "
+                        "or suppressed duplicates; check the logs for "
+                        "duplicate_tool_call_suppressed."
+                    )
+                else:
+                    st.success("No repeated tool usage in this session.")
+                st.caption(
+                    "Plan step state is derived from persisted actions; live "
+                    "per-step telemetry is in the structured logs "
+                    "(plan_validated / plan_step_satisfied / plan_completed)."
+                )
 
 
 def _render_knowledge(backend: Any) -> None:
