@@ -12,6 +12,9 @@ this instead (cron / systemd timer / CI):
     uv run python -m jarvis.maintenance sessions --expired
     uv run python -m jarvis.maintenance cleanup --days 30
     uv run python -m jarvis.maintenance stats
+    uv run python -m jarvis.maintenance cache stats
+    uv run python -m jarvis.maintenance cache inspect
+    uv run python -m jarvis.maintenance cache cleanup [--expire-older-than-days N]
     uv run python -m jarvis.maintenance expire-confirmations --minutes 60
 
 v0.18: ``actions`` / ``unknown-actions`` / ``sessions`` are strictly
@@ -40,6 +43,17 @@ from jarvis.memory.session_store import (
 from jarvis.utils.logging import get_logger, setup_logging
 
 log = get_logger(__name__)
+
+
+def _maintenance_parse_ts(value: str) -> float:
+    """Parse a store timestamp for display; failures return 0 (never raise)."""
+    try:
+        from jarvis.memory.session_store import _parse_ts
+
+        return _parse_ts(value).timestamp()
+    except Exception:
+        return 0.0
+
 
 # One-shot flag so the remove-guard can honor --yes without threading a
 # parameter through every cmd_ signature.
@@ -714,6 +728,102 @@ def assume_yes_removal(skip: bool = False) -> bool:
     return True
 
 
+def cmd_cache(
+    store: SessionStore,
+    action: str,
+    *,
+    limit: int = 25,
+    expire_older_than_days: int | None = None,
+    yes: bool = False,
+) -> int:
+    """v0.24 cross-turn result cache operations (Part H).
+
+    ``stats``   — entries / hits / expired / per-tool counts (read-only).
+    ``inspect`` — metadata-only listing (fingerprint, tool, scope, age,
+                  hits). NEVER prints cached payloads (Part Q).
+    ``cleanup`` — bounded deletion: expired rows only by default;
+                  ``--expire-older-than-days N`` additionally expires and
+                  removes rows older than N days (still bounded by --limit).
+    """
+    if action == "stats":
+        stats = store.cache_stats()
+        print(f"entries: {stats['entries']}  hits: {stats['hits']}  expired: {stats['expired']}")
+        for row in stats["per_tool"]:
+            print(f"  {row['tool_name']:<22} entries={row['entries']:<6} hits={row['hits']}")
+        if stats["entries"] == 0:
+            print("(result cache is empty)")
+        # v0.25 (Part E4): today's daily aggregates — counts only, never
+        # payloads or queries.
+        today_rows = store.cache_metrics_history(days=1, limit=1)
+        if today_rows:
+            t = today_rows[0]
+            print(
+                f"today: hits={t['hits']} misses={t['misses']} "
+                f"stale={t['stale']} bypass={t['bypass']} stores={t['stores']}"
+            )
+            for tool, deltas in sorted(t.get("per_tool", {}).items()):
+                parts = ", ".join(f"{k}={v}" for k, v in sorted(deltas.items()))
+                print(f"  {tool:<22} {parts}")
+        else:
+            print("today: no cache activity recorded")
+        return 0
+
+    if action == "inspect":
+        rows = store.list_cache_entries(limit=limit)
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            try:
+                age_s = max(0.0, now.timestamp() - _maintenance_parse_ts(r["created_at"]))
+                age = f"{int(age_s // 60)}m" if age_s < 86400 else f"{int(age_s // 86400)}d"
+            except Exception:
+                age = "?"
+            exp = r.get("expires_at") or "—"
+            print(
+                f"{r['cache_key'][:16]}  {r['tool_name']:<22} scope={r['scope']:<7} "
+                f"hits={r['hit_count']:<4} age={age:<5} expires={exp}"
+            )
+        if not rows:
+            print("(no cache entries)")
+        else:
+            print(f"({len(rows)} entry(ies), payloads withheld — keys are fingerprints, not content)")
+        return 0
+
+    if action == "cleanup":
+        removed_expired = store.cleanup_result_cache(expired_only=True, limit=500)
+        print(f"Removed {removed_expired} expired cache row(s) (bounded: 500/invocation).")
+        if expire_older_than_days is not None:
+            if not yes:
+                reply = input(
+                    f"Also expire+remove cache rows older than {expire_older_than_days}d? [y/N] "
+                )
+                if reply.strip().lower() not in ("y", "yes"):
+                    print("Aborted; only expired rows were removed.")
+                    return 0
+            cutoff = (
+                datetime.now(timezone.utc).timestamp() - expire_older_than_days * 86400
+            )
+            cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+            with store._lock:
+                cursor = store._conn.execute(
+                    """
+                    DELETE FROM result_cache WHERE cache_key IN (
+                        SELECT cache_key FROM result_cache
+                        WHERE created_at <= ? LIMIT 500
+                    )
+                    """,
+                    (cutoff_iso,),
+                )
+                removed_old = cursor.rowcount or 0
+                store._conn.commit()
+            print(f"Removed {removed_old} row(s) older than {expire_older_than_days}d (bounded: 500/invocation).")
+        stats = store.cache_stats()
+        print(f"remaining entries: {stats['entries']}")
+        return 0
+
+    print(f"ERROR: unknown cache action '{action}'", file=sys.stderr)
+    return 2
+
+
 def cmd_stats(store: SessionStore) -> int:
     with store._lock:
         conn = store._conn
@@ -846,6 +956,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_knowledge.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_cache = sub.add_parser(
+        "cache",
+        help="v0.24 cross-turn result cache: stats / inspect / cleanup (bounded)",
+    )
+    p_cache.add_argument(
+        "action", choices=["stats", "inspect", "cleanup"]
+    )
+    p_cache.add_argument("--limit", type=int, default=25, help="Rows shown by inspect (default 25)")
+    p_cache.add_argument(
+        "--expire-older-than-days", type=int, default=None,
+        help="cleanup: ALSO expire+remove rows older than N days (bounded, confirm prompt)",
+    )
+    p_cache.add_argument("--yes", action="store_true", help="Skip the cleanup confirm prompt")
+
     args = parser.parse_args(argv)
 
     store = None
@@ -887,6 +1011,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "expire-confirmations":
             return cmd_expire_confirmations(store)
+        if args.command == "cache":
+            return cmd_cache(
+                store,
+                args.action,
+                limit=args.limit,
+                expire_older_than_days=args.expire_older_than_days,
+                yes=args.yes,
+            )
         if args.command == "stats":
             return cmd_stats(store)
         if args.command == "doctor":

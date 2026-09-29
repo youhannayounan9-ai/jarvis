@@ -21,6 +21,18 @@ class ChatRequest(BaseModel):
         max_length=64,
         description="Existing session ID. Omit to start a new session.",
     )
+    refresh: bool = Field(
+        default=False,
+        description=(
+            "v0.25 explicit programmatic freshness control. When true, "
+            "cache-eligible read-only retrieval tools (web/search/file/knowledge) "
+            "bypass the cross-turn result cache for THIS turn and execute for "
+            "real; fresh successful results are stored again as usual. Never "
+            "bypasses permissions, schema validation, or confirmation — cache "
+            "eligibility only. Natural-language freshness wording continues to "
+            "work independently."
+        ),
+    )
 
 
 class ConfirmationRequest(BaseModel):

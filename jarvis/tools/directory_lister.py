@@ -13,7 +13,7 @@ Security model — sandboxing:
 from pathlib import Path
 
 from jarvis.config import settings
-from jarvis.tools.base import BaseTool
+from jarvis.tools.base import BaseTool, CachePolicy
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -45,6 +45,13 @@ class ListDirectoryTool(BaseTool):
         },
         "required": ["path"],
     }
+    # v0.24 (Part B, Class 3 conditional): directory CONTENT changes with the
+    # filesystem — a directory's stat (size/mtime) changes whenever entries
+    # are added/removed/renamed. Session-scoped + source_stat freshness,
+    # verbatim keys (paths are never whitespace-normalized — Part M).
+    cache_policy = CachePolicy(
+        scope="session", freshness="source_stat", normalizer="verbatim"
+    )
 
     def run(self, path: str, **kwargs) -> str:
         allowed_dir = settings.file_reader_allowed_path

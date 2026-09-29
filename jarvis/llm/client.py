@@ -36,6 +36,7 @@ def chat_completion(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
     model: str | None = None,
+    temperature: float | None = None,
 ) -> Any:
     """
     Send a synchronous chat completion request to Ollama via LiteLLM.
@@ -48,6 +49,10 @@ def chat_completion(
                   tool_calls instead of (or in addition to) text.
         model:    Optional LiteLLM model string override (e.g. planner model).
                   Defaults to ``settings.litellm_model``.
+        temperature: Optional sampling temperature override. Omitted →
+                  LiteLLM default. Transcription-style calls (synthesis over
+                  tool evidence) should pass a LOW value: the task is exact
+                  preservation of measured values, not ideation.
 
     Returns:
         A LiteLLM ModelResponse object. Callers inspect:
@@ -84,6 +89,9 @@ def chat_completion(
         kwargs["tools"] = tools
         # "auto" lets the model decide whether to call a tool or reply directly.
         kwargs["tool_choice"] = "auto"
+
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
     response = litellm.completion(**kwargs)
 

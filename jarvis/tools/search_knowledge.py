@@ -24,7 +24,7 @@ from jarvis.memory.knowledge import (
     format_evidence_block,
     get_knowledge_service,
 )
-from jarvis.tools.base import BaseTool
+from jarvis.tools.base import BaseTool, CachePolicy
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -75,6 +75,13 @@ class SearchKnowledgeTool(BaseTool):
         "required": ["query"],
     }
     risk_level = "SAFE"
+    # v0.24 (Part B, Class 2 conditional): retrieval over the user's OWN
+    # ingested documents. Valid across turns while the knowledge REGISTRY is
+    # unchanged (knowledge_generation invalidation — no Chroma scan per
+    # query). Session-scoped: document evidence is user-private (Part C3).
+    cache_policy = CachePolicy(
+        scope="session", freshness="knowledge_generation", normalizer="generic"
+    )
 
     def run(
         self,

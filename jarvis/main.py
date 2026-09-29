@@ -110,6 +110,10 @@ def _print_help() -> None:
     table.add_row("/history", "Show this session's conversation")
     table.add_row("/voice", "Enter voice mode (speak with JARVIS)")
     table.add_row("/new", "Start a fresh session (clears context)")
+    table.add_row(
+        "/refresh",
+        "Toggle refresh mode (re-fetch cached results this session)",
+    )
     table.add_row("/confirm", "Confirm a pending high-risk action")
     table.add_row("/deny", "Deny a pending high-risk action")
     table.add_row("/quit", "Exit JARVIS")
@@ -225,10 +229,21 @@ def _start_voice_mode(orchestrator: Orchestrator, session_id: str) -> None:
         console.print("\n[dim]Returned to text mode.[/dim]\n")
 
 
-def _chat_loop(runtime: JarvisRuntime) -> None:
-    """The main read-eval-print loop."""
+def _chat_loop(runtime: JarvisRuntime, refresh: bool = False) -> None:
+    """The main read-eval-print loop.
+
+    ``refresh`` (v0.25 Part D3) is the session-wide default for programmatic
+    cache refresh: when True, every turn sets refresh=True on the orchestrator
+    (bypasses ELIGIBLE cache entries for that turn; permissions, validation
+    and confirmation are unaffected). Toggled per-session with /refresh.
+    """
     session_id = runtime.start_session()
     _print_session_banner(session_id)
+    if refresh:
+        console.print(
+            "[dim]Refresh mode ON for this session: cached results are "
+            "re-fetched (use /refresh to toggle).[/dim]"
+        )
 
     while True:
         try:
@@ -265,6 +280,19 @@ def _chat_loop(runtime: JarvisRuntime) -> None:
             console.print()
             _print_session_banner(session_id, fresh=True)
             continue
+
+        if command == "/refresh":
+            refresh = not refresh
+            console.print(
+                f"[dim]Refresh mode {'ON' if refresh else 'OFF'}: "
+                + (
+                    "cached results will be re-fetched this session."
+                    if refresh
+                    else "normal cache policy restored."
+                )
+                + "[/dim]"
+            )
+            continue
             
         if command == "/confirm" or command == "/deny":
             with console.status("[cyan]Processing...[/cyan]", spinner="dots"):
@@ -285,7 +313,7 @@ def _chat_loop(runtime: JarvisRuntime) -> None:
 
         with console.status("[cyan]Thinking…[/cyan]", spinner="dots"):
             try:
-                response = runtime.chat(session_id, user_input)
+                response = runtime.chat(session_id, user_input, refresh=refresh)
             except Exception as e:
                 log.error("orchestrator_error", error=str(e))
                 console.print(f"\n[red]Error:[/red] {e}")
@@ -316,6 +344,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Start in voice mode (Whisper STT + Edge TTS)",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help=(
+            "Start with refresh mode ON: bypass eligible cache entries each "
+            "turn (re-fetch fresh results; permissions unchanged). Toggle "
+            "mid-session with /refresh."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -337,7 +374,7 @@ def main(argv: list[str] | None = None) -> None:
             _print_session_banner(session_id)
             _start_voice_mode(runtime.orchestrator, session_id)
         else:
-            _chat_loop(runtime)
+            _chat_loop(runtime, refresh=bool(args.refresh))
     finally:
         runtime.close()
 

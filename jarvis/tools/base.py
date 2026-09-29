@@ -20,6 +20,7 @@ Tool result contract:
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Literal, Type
 
 from pydantic import BaseModel, create_model, Field, ValidationError
@@ -39,6 +40,40 @@ _VALID_RISK_LEVELS: frozenset[str] = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class CachePolicy:
+    """
+    v0.24 explicit cross-turn cacheability declaration (Parts B/C2).
+
+    A tool OPTS IN to the cross-turn result cache by setting ``cache_policy``
+    on the class; tools without a policy are NEVER cached (the safe default —
+    side-effect and state-coupled tools simply don't declare one).
+
+    Fields:
+        cacheable:       True → the result may be stored and reused across turns.
+        ttl_seconds:     Time-based expiration. None → freshness comes from
+                         ``freshness`` (source state), not the clock.
+        scope:           "global" (any session may reuse) or "session"
+                         (only the session that produced the result).
+                         Global is reserved for public/deterministic content.
+        freshness:       "ttl" (clock only) | "source_stat" (re-stat the
+                         argument path; size/mtime change ⇒ stale) |
+                         "knowledge_generation" (stale when the knowledge
+                         base registry changes).
+        normalizer:      Cache-KEY normalization for arguments:
+                         "generic" (v0.23 canonical JSON; collapses value
+                         whitespace) | "verbatim" (key-sort only — paths,
+                         URLs, code) | "calculator_expression" (existing AST
+                         parser proves equivalence: 2+2 ≡ 2 + 2 ≡ (2+2)).
+    """
+
+    cacheable: bool = True
+    ttl_seconds: float | None = None
+    scope: Literal["global", "session"] = "global"
+    freshness: Literal["ttl", "source_stat", "knowledge_generation"] = "ttl"
+    normalizer: Literal["generic", "verbatim", "calculator_expression"] = "generic"
+
+
 class BaseTool(ABC):
     """Abstract base for all JARVIS tools."""
 
@@ -54,6 +89,11 @@ class BaseTool(ABC):
     # their side effects. timeout_seconds may be raised for slow network tools.
     risk_level: RiskLevel = "SAFE"
     timeout_seconds: float = 15.0
+
+    # v0.24: cross-turn result-cache policy. None (the default) = never cached.
+    # Declare ONLY for read-only retrieval whose semantics survive reuse;
+    # see jarvis/core/result_cache.py for the enforcement boundary.
+    cache_policy: "CachePolicy | None" = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Validate risk_level / timeout_seconds when a concrete tool is defined."""

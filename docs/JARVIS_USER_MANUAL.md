@@ -221,6 +221,7 @@ Session banner shows version, model, and tool count. Commands:
 | `/tools` | List the registered tool surface |
 | `/history` | Print this session's messages |
 | `/voice` | Enter voice mode (returns to text with "exit") |
+| `/refresh` | Toggle refresh mode — force fresh (non-cached) tool runs for your next messages (v0.25) |
 | `/new` | Fresh session (new ID, cleared context) |
 | `/confirm` | Approve a pending high-risk action |
 | `/deny` | Deny a pending high-risk action |
@@ -421,7 +422,59 @@ Honest limits: the local 7B model still over-plans tools for pure-explanation qu
 
 **How completion is known:** every plan step must either produce its required tool evidence or legitimately not need one; JARVIS logs which steps were completed, failed, or skipped, and only synthesizes the final answer once the plan is done (or its failure budget is spent). The Dashboard's Operations page shows the same picture per session: executions, successes, failures, and a repeated-tool warning that notes repeats may be legitimate or suppressed.
 
-Honest limits: suppression matches *exact arguments* — `"2+2"` and `"2 + 2"` are different strings and fingerprint differently; the model re-running a search with reworded arguments is doing different (legitimate) work by this rule.
+Honest limits: suppression matches *exact arguments* — `"2+2"` and `"2 + 2"` are different strings and fingerprint differently; the model re-running a search with reworded arguments is doing different (legitimate) work by this rule. (For the *calculator* specifically, v0.24's cross-turn cache DOES close this gap — see §8f.)
+
+---
+
+## 8f. Remembering Across Turns & Recovering from Failure (v0.24)
+
+v0.23 stopped repeated work *inside* one turn (§8e). v0.24 adds the two pieces that were still missing: useful retrieval is remembered **across turns**, and a half-finished plan gets **one honest second chance**.
+
+### Cross-turn reuse (the result cache)
+
+Ask the same question twice — even days apart — and JARVIS may not need to repeat the work:
+
+- **What is reused:** read-only retrieval only — `web_search`, `wikipedia_summary`, `web_scrape`, `read_file`, `list_directory`, `search_knowledge`. Cacheability is declared per tool; anything that *does* something (writing files, vision, code execution, computer control) or is *supposed* to change (`get_current_datetime`, your memory) is **never** served from cache — it always really runs.
+- **Freshness is per tool:** web results expire after ~5 minutes, Wikipedia after a day, the knowledge-base retrieval is invalidated the moment you ingest or remove a document, and file/directory answers are re-checked against the file's size + modification time. A changed file ⇒ the cache is not trusted.
+- **You are told:** a reused answer is prefixed in the model's context with a provenance note — *"cached result: retrieved 5m ago … not a live re-run"* — so JARVIS can qualify it instead of presenting stale data as live.
+- **You are in control:** ask for the *latest*, *current*, *today*, *breaking*, etc., and JARVIS skips time-sensitive cache entries and fetches fresh data. There is no configuration surface to learn — your wording is the switch.
+- **Privacy:** your files and your knowledge base are cached **per session**; only public, deterministic content (e.g. calculator results, public web lookups) is shared between sessions. The maintenance CLI (`maintenance cache stats / inspect / cleanup`) shows counts and fingerprints, never payloads.
+- **The calculator is exact:** the cache keys on the *evaluated value* using the calculator's own parser, so `2+2`, `2 + 2`, `(2+2)` and `5-1` all reuse one entry. Different values never collide.
+
+Power users: set `JARVIS_DISABLE_RESULT_CACHE=true` to restore always-fresh behavior.
+
+### The one bounded replan
+
+When a multi-step task **structurally fails** — a required tool errored and could not be completed (not merely a verbose or odd-looking answer) — JARVIS now gets **one** automatic second chance:
+
+1. the original plan runs; completed work is kept;
+2. if a required step failed **and** tool budget remains, a *replan* is generated for **only the unfinished requirements** (already-done steps are explicitly excluded);
+3. the replan goes through the same validation, permissions, and repeat guards as any plan, within the **remaining** budget — nothing is reset;
+4. if the replan also fails, JARVIS **tells you plainly what remains unfinished** instead of pretending the task completed. The Dashboard's Operations page (`Result cache` section) and the structured logs (`replan_triggered`, `plan_completed … complete=true/false`) show all of this.
+
+Recursion is impossible by construction: the replan path cannot trigger another replan. A plan is still a request, never an authorization. Every replan is also **diffed** against the plan that failed — the `replan_diff` log/SSE event shows which steps were added, removed, or retargeted (structure only, never tool arguments).
+
+---
+
+## 8g. Grounded Answers, Refresh Mode & Cache Metrics (v0.25)
+
+### Answers come from the evidence, not the model's memory
+
+When tools run during a turn, JARVIS now keeps a bounded **evidence ledger** of their raw results and hands it to the final answer step as **AUTHORITATIVE TOOL EVIDENCE**, with one instruction: transcribe tool-derived values exactly; never recompute them. This closes a real, live-observed gap — the model once announced 42071 for 893 × 47 even though the calculator had correctly produced 41971. The ledger is bounded (at most 16 items, 1200 characters each) and is framed as data, never as instructions.
+
+### Refresh mode (client-controlled)
+
+You can force JARVIS to ignore cached results and really re-run the tools:
+
+- **CLI:** start with `--refresh`, or toggle `/refresh` during a session (state shown in the banner/help).
+- **Dashboard:** the sidebar has a **Refresh mode (bypass cache)** toggle.
+- **API:** `POST /chat` accepts `"refresh": true` (the Python client takes `refresh=`).
+
+Refresh skips **only the result cache**. Permissions, confirmation gates, repeat-suppression, and schema validation all still apply — a refresh of a high-risk action still parks for your approval. Asking for the *latest/today/current* still bypasses time-sensitive entries automatically, as before.
+
+### Cache metrics over time
+
+Every turn records hit/miss/stale/bypass/store counters (per tool) into a small daily table kept for 30 days by default (`RESULT_CACHE_METRICS_RETENTION_DAYS`). View it three ways: the dashboard's **Daily cache activity (last 14 days)** table, the API `GET /ops/cache/stats/history`, or `maintenance cache stats`, which now prints today's counters and per-tool deltas.
 
 ---
 

@@ -30,6 +30,13 @@ Run (manual; requires Ollama + qwen2.5:7b — NOT part of pytest):
 
 from __future__ import annotations
 
+# ISOLATION (v0.25 Part G): shared bootstrap — private temp DB BEFORE any
+# jarvis import (dispatch-count and suppression metrics are invalid against a
+# real jarvis.db holding cross-turn cache entries from earlier sessions).
+from evaluation import _bootstrap as _eval
+
+_eval.isolate()
+
 import argparse
 import json
 import os

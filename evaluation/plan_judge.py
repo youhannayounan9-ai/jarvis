@@ -22,6 +22,8 @@ Run:
     uv run python evaluation/plan_judge.py --request "Calculate 5*5 and remember it"
 """
 
+
+
 from __future__ import annotations
 
 import argparse
@@ -34,6 +36,12 @@ from typing import Any
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+# ISOLATION (v0.25 Part G): run against a private temp DB — never the
+# real jarvis.db (cross-turn cache entries would leak across runs).
+from evaluation import _bootstrap as _eval
+
+_eval.isolate()
 
 from jarvis.config import settings
 from jarvis.llm.client import chat_completion

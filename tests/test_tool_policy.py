@@ -318,6 +318,8 @@ class TestForcedToolRound:
         responses = [
             fake_tool_response([("calculator", '{"expression": "893 * 47"}')]),
             fake_text_response("893 * 47 = 41971."),
+            # v0.25: evidence-grounded wrap-up call
+            fake_text_response("893 * 47 = 41971."),
         ]
 
         with patch(
@@ -329,9 +331,13 @@ class TestForcedToolRound:
                     answer = orch.chat("s_net2", "What is 893 * 47?")
 
         assert dispatched == ["calculator"]
-        assert answer == "893 * 47 = 41971."
-        # execute round + post-tool answer; NO extra enforcement call.
-        assert mock_llm.call_count == 2
+        # v0.25: when the fast path actually ran a tool, one evidence-grounded
+        # wrap-up call follows (the tool result outranks the model's prose) —
+        # so the LLM is called 3× (tool round, post-tool answer, grounded
+        # synthesis) and the FINAL answer still contains the exact value.
+        assert "41971" in answer
+        # execute round + post-tool answer + evidence-grounded synthesis.
+        assert mock_llm.call_count == 3
         store.close()
 
     def test_net_bounded_when_model_refuses_twice(self):
@@ -648,6 +654,8 @@ class TestDeterministicCalculatorFallback:
             side_effect=[
                 fake_tool_response([("calculator", '{"expression": "893 * 47"}')]),
                 fake_text_response("893 * 47 equals 41971."),
+                # v0.25: evidence-grounded wrap-up call
+                fake_text_response("893 * 47 equals 41971."),
             ],
         ) as mock_llm:
             with patch.object(registry, "dispatch_async", side_effect=spy):
@@ -656,10 +664,11 @@ class TestDeterministicCalculatorFallback:
 
         assert dispatched == [("calculator", '{"expression": "893 * 47"}')]
         assert "41971" in answer
-        assert mock_llm.call_count == 2
-        # No TOOL RESULT injection note in the final call (normal path)
-        final_msgs = mock_llm.call_args_list[1][1]["messages"]
-        assert not any("TOOL RESULT" in str(m.get("content")) for m in final_msgs)
+        # v0.25: tool ran → evidence-grounded wrap-up is the THIRD call, and
+        # its prompt carries the AUTHORITATIVE TOOL EVIDENCE block.
+        assert mock_llm.call_count == 3
+        final_msgs = mock_llm.call_args_list[2][1]["messages"]
+        assert any("AUTHORITATIVE TOOL EVIDENCE" in str(m.get("content")) for m in final_msgs)
         store.close()
 
 

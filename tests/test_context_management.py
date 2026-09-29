@@ -62,7 +62,9 @@ def test_active_tool_truncation():
     responses = [
         # Round 1: LLM calls web_search
         Response([Choice(Message("assistant", None, [ToolCall("call_1", Function("web_search", "{}"))]))]),
-        # Round 2: LLM answers the user (stops loop)
+        # Round 2: LLM answers the user (stops the ReAct loop)
+        Response([Choice(Message("assistant", "Final answer based on search."))]),
+        # v0.25: the fast path then makes one evidence-grounded wrap-up call
         Response([Choice(Message("assistant", "Final answer based on search."))]),
     ]
 
@@ -81,15 +83,22 @@ def test_active_tool_truncation():
                     with patch.object(orchestrator, "route_intent", return_value="simple"):
                         orchestrator.chat("session_123", "Search for something huge")
 
-    # The last LLM call should contain the clamped tool result
+    # The LAST (evidence-grounded wrap-up) call must carry the clamped tool
+    # result — the v0.25 evidence item is clamp-bounded like every raw copy.
+    # The evidence block travels on the final synthesis message (v0.25: the
+    # FINAL USER message — live-verified; scan all roles).
     last_call_messages = mock_llm.call_args[1]["messages"]
-    tool_message = [m for m in last_call_messages if m["role"] == "tool"][0]
+    evidence_blob = " ".join(
+        str(m["content"]) for m in last_call_messages
+    )
 
-    assert len(tool_message["content"]) < len(huge_payload)
-    assert len(tool_message["content"]) <= settings.max_tool_output_chars + 2000
-    assert "characters omitted" in tool_message["content"]
+    assert len(evidence_blob) < len(huge_payload)
+    # The evidence ITEM is clamp-bounded; the blob also carries the base
+    # system prompt, so allow that overhead.
+    assert len(evidence_blob) <= settings.max_tool_output_chars + 3500
+    assert "characters omitted" in evidence_blob
     # Head is preserved (payload was uniform 'A's, so start must be present)
-    assert tool_message["content"].startswith("AAA")
+    assert "AAA" in evidence_blob
 
     # The database should have saved the full payload
     row = store._conn.execute("SELECT content FROM messages WHERE role='tool'").fetchone()

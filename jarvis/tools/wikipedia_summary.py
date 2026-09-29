@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from jarvis.tools.base import BaseTool
+from jarvis.tools.base import BaseTool, CachePolicy
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -52,6 +52,10 @@ class WikipediaSummaryTool(BaseTool):
         },
         "required": ["query"],
     }
+    # v0.24 (Part B, Class 2): encyclopedic summaries change slowly — a long
+    # TTL (RESULT_CACHE_WIKI_TTL_SECONDS) with provenance labeling. Scope is
+    # global: article content is public and argument-independent of the user.
+    cache_policy = CachePolicy(scope="global", freshness="ttl", normalizer="generic")
 
     def run(self, query: str, **kwargs) -> str:
         query = (query or "").strip()

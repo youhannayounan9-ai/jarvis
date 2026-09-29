@@ -102,6 +102,29 @@ class Settings(BaseSettings):
     RATE_LIMIT_REQUESTS: int = 60
     RATE_LIMIT_WINDOW_SECONDS: int = 60
 
+    # ── Cross-turn result cache (v0.24) ───────────────────────────────
+    # Bounded SQLite-backed cache of READ-ONLY retrieval results, reused
+    # across turns with explicit TTL/freshness policies per tool class.
+    # NEVER caches side-effect or state-coupled tools. Kill switch restores
+    # exact v0.23 behavior (no cache lookups, no cache stores).
+    JARVIS_DISABLE_RESULT_CACHE: bool = False
+    # Hard cap on stored entries; the oldest EXPIRED entries are evicted
+    # first at store time, never valid ones (bounded maintenance).
+    RESULT_CACHE_MAX_ENTRIES: int = 200
+    # v0.25 (Part E): bounded retention for daily cache-operations snapshots.
+    RESULT_CACHE_METRICS_RETENTION_DAYS: int = 30
+    # Default TTL for tools that declare a TTL policy but no explicit value.
+    RESULT_CACHE_DEFAULT_TTL_SECONDS: int = 900
+    # Web freshness: identical web_search / web_scrape re-queries inside
+    # this window reuse the cached result (provenance attached). Deliberately
+    # SHORT — external pages change; provenance keeps the agent honest.
+    RESULT_CACHE_WEB_TTL_SECONDS: int = 300
+    # Wikipedia: encyclopedic content changes slowly.
+    RESULT_CACHE_WIKI_TTL_SECONDS: int = 86400
+    # calculator is a pure function of its arguments: no time decay, only a
+    # global entry cap.
+    RESULT_CACHE_CALC_TTL_SECONDS: int = 604800
+
     # ── Dashboard → API client (v0.11) ────────────────────────────────
     # The Streamlit dashboard consumes the REST API instead of wiring its own
     # runtime. Empty URL falls back to the legacy in-process runtime.

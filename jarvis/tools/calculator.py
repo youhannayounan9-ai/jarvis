@@ -10,7 +10,7 @@ Does not use `eval()` to ensure strict sandboxing against arbitrary code executi
 import ast
 import operator
 
-from jarvis.tools.base import BaseTool
+from jarvis.tools.base import BaseTool, CachePolicy
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -76,6 +76,36 @@ def safe_math_eval(expr: str) -> float | int:
         raise ValueError(str(e))
 
 
+def canonical_expression_form(expr: str) -> str | None:
+    """
+    v0.24 (Part M): deterministic canonical form of a calculator expression,
+    for CACHE-KEY equivalence only — '2+2', '2 + 2', '(2+2)', and even
+    '5-1' map to the same cache entry when they evaluate to the same value.
+
+    Uses THIS module's existing deterministic AST parser (no new math parser
+    is invented — Part M). Because the calculator is a PURE FUNCTION of its
+    expression, the evaluated value itself is the strongest canonical form:
+    two expressions share a cache entry exactly when the tool would return
+    the same result, which is the definition of safe reuse.
+
+    Returns None when the expression cannot be parsed/evaluated safely — the
+    caller then falls back to the generic (verbatim-whitespace) key, so a
+    malformed expression is never confused with a valid one. NEVER used to
+    decide execution; the real dispatch always runs the actual expression.
+    """
+    try:
+        value = safe_math_eval(expr)
+    except Exception:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if float(value).is_integer():
+        return str(int(value))
+    return repr(float(value))
+
+
 class CalculatorTool(BaseTool):
     name = "calculator"
     description = (
@@ -101,6 +131,16 @@ class CalculatorTool(BaseTool):
         },
         "required": ["expression"],
     }
+    # v0.24 (Part B, Class 2): a PURE deterministic function of its argument.
+    # Cross-turn reuse is always safe; freshness is trivial (its result can't
+    # decay), and the entry cap is the only eviction. Key normalization
+    # proves expression equivalence with the same AST parser that executes
+    # it (Part M): 2+2, 2 + 2 and (2+2) share one cache entry.
+    cache_policy = CachePolicy(
+        scope="global",
+        freshness="ttl",
+        normalizer="calculator_expression",
+    )
 
     def run(self, expression: str, **kwargs) -> str:
         log.info("calculator", expression=expression)

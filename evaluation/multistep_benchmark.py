@@ -30,6 +30,14 @@ Run:
 
 from __future__ import annotations
 
+# ISOLATION (v0.25 Part G): shared bootstrap — private temp DB BEFORE any
+# jarvis import. A standalone run against the real jarvis.db would legitimately
+# SERVE cached results instead of dispatching (measured live in v0.24),
+# invalidating dispatch-count graders.
+from evaluation import _bootstrap as _eval
+
+_eval.isolate()
+
 import argparse
 import json
 import sys
@@ -373,7 +381,11 @@ def run_case(case: dict[str, Any], registry: ToolRegistry) -> dict[str, Any]:
     driver hands out the next round on each tools-enabled LLM call, exactly
     mirroring the ReAct round structure.
     """
-    store = SessionStore()
+    # v0.25: per-case hermetic store. Under pytest every SessionStore already
+    # gets its own private ':memory:' DB; standalone, isolate()'s shared file
+    # DB would let the global calculator cache (7-day TTL) serve one case's
+    # expression to a later case (zero dispatches, invalid measurement).
+    store = _eval.fresh_store()
     guard = PermissionGuard()
     orch = Orchestrator(store, registry, guard)
 
@@ -553,8 +565,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", dest="json_path", default=None)
     args = parser.parse_args(argv)
 
-    registry = _build_registry()
-    records = [run_case(case, registry) for case in MULTISTEP_CASES]
+    # v0.25: each run_case builds its own registry + hermetic store (the
+    # registry is stateless; the cache lives in the store's database).
+    records = [run_case(case, _build_registry()) for case in MULTISTEP_CASES]
 
     total = len(records)
     passed = sum(1 for r in records if r["passed"])

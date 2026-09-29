@@ -88,7 +88,7 @@ log = get_logger(__name__)
 app = FastAPI(
     title="JARVIS API",
     description="Local-first AI assistant — agent runtime over HTTP.",
-    version="0.23.0",
+    version="0.25.0",
 )
 
 # ── Runtime dependency (overridable in tests) ─────────────────────────────────
@@ -255,7 +255,7 @@ def chat(
     session_id = _resolve_session(runtime, payload.session_id)
 
     try:
-        response_text = runtime.chat(session_id, payload.message)
+        response_text = runtime.chat(session_id, payload.message, refresh=payload.refresh)
     except TimeoutError as e:
         log.warning("api_chat_busy", session_id=session_id)
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -288,7 +288,7 @@ def _sse(event: str, data: dict) -> str:
 _SSE_HEARTBEAT_SECONDS = 15.0
 
 
-def _event_stream(runtime: JarvisRuntime, session_id: str, message: str):
+def _event_stream(runtime: JarvisRuntime, session_id: str, message: str, refresh: bool = False):
     """
     Generator bridging orchestrator lifecycle events to SSE.
 
@@ -321,7 +321,7 @@ def _event_stream(runtime: JarvisRuntime, session_id: str, message: str):
 
     def worker() -> None:
         try:
-            response_text = runtime.chat(session_id, message, on_event=collect)
+            response_text = runtime.chat(session_id, message, on_event=collect, refresh=refresh)
             events.put({"__result": response_text})
         except Exception as e:
             # Sanitized like POST /chat: details stay in the log (keyed by
@@ -385,7 +385,7 @@ def chat_stream(
     _enforce_rate_limit(request)
     session_id = _resolve_session(runtime, payload.session_id)
     return StreamingResponse(
-        _event_stream(runtime, session_id, payload.message),
+        _event_stream(runtime, session_id, payload.message, refresh=payload.refresh),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -613,6 +613,40 @@ def get_session_timeline(
         raise HTTPException(status_code=404, detail="Unknown session_id.")
     events = runtime.store.get_session_timeline(session_id, limit=limit)
     return [TimelineEvent(**e) for e in events]
+
+
+# ── v0.24: cross-turn result cache (safe metadata only) ───────────────────────
+
+
+@app.get("/ops/cache/stats")
+def get_cache_stats(
+    request: Request,
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> dict:
+    """
+    Bounded cache telemetry (Part R): entries / hits / expired / per-tool
+    counts. NEVER exposes cached payloads or argument fingerprints.
+    """
+    _enforce_rate_limit(request)
+    return runtime.store.cache_stats()
+
+
+@app.get("/ops/cache/stats/history")
+def get_cache_stats_history(
+    request: Request,
+    days: int = Query(default=14, ge=1, le=365),
+    limit: int = Query(default=30, ge=1, le=365),
+    runtime: JarvisRuntime = Depends(get_runtime),
+    _auth: None = _AUTH,
+) -> list[dict]:
+    """
+    v0.25 historical cache-operations aggregates (Part E3): one row per day
+    {day, hits, misses, stale, bypass, stores, per_tool}. Aggregates only —
+    no queries, fingerprints, or payloads. Bounded by days/limit.
+    """
+    _enforce_rate_limit(request)
+    return runtime.store.cache_metrics_history(days=days, limit=limit)
 
 
 # ── v0.20: personal knowledge base (documents are untrusted data) ────────────

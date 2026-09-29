@@ -6,7 +6,7 @@ Tool: web_scrape
 Uses Playwright to load a webpage fully (including JS) and extracts its text.
 """
 
-from jarvis.tools.base import BaseTool
+from jarvis.tools.base import BaseTool, CachePolicy
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -37,6 +37,12 @@ class WebScrapeTool(BaseTool):
     }
     risk_level = "NETWORK"
     timeout_seconds = 30.0
+    # v0.24 (Part B, Class 3 conditional): a full browser page load is the
+    # most expensive retrieval JARVIS has — a short TTL with provenance is
+    # the honest middle ground between cost and freshness. Keys are VERBATIM:
+    # URLs are never whitespace-normalized (Part M). Requests asking for
+    # latest/current content bypass the cache (Part L).
+    cache_policy = CachePolicy(scope="global", freshness="ttl", normalizer="verbatim")
 
     def run(self, url: str, **kwargs) -> str:
         try:

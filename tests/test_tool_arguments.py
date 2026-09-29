@@ -144,7 +144,9 @@ class TestSelfCorrectionAfterValidationFailure:
             fake_tool_response([("calculator", "{}")]),
             # Recovery round: corrected arguments.
             fake_tool_response([("calculator", '{"expression": "144 / 12"}')]),
-            # Final grounded answer.
+            # Post-tool answer.
+            fake_text_response("144 / 12 = 12."),
+            # v0.25: evidence-grounded wrap-up call.
             fake_text_response("144 / 12 = 12."),
         ]
 

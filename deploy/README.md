@@ -285,6 +285,47 @@ security control, not an optimization:
   `redundant_plan_step` (an identical later step was skipped), and
   `plan_completed` (planned/completed/failed steps, suppressed duplicates,
   complete=bool — the one-line "did the plan actually finish?" signal).
+- **Cross-turn result cache (v0.24)** — read-only retrieval tools reuse
+  still-valid results across turns. Operational notes:
+  - storage is the SAME SQLite `jarvis.db` (`result_cache` table), bounded
+    by `RESULT_CACHE_MAX_ENTRIES` (default 200) — expired rows purge at
+    store time; oldest-evict only when still over the cap. WAL backups
+    include the cache automatically; deleting the DB clears it.
+  - kill switch: `JARVIS_DISABLE_RESULT_CACHE=true` restores always-fresh
+    behavior (test-pinned).
+  - TTLs are env-tunable: `RESULT_CACHE_WEB_TTL_SECONDS` (300),
+    `RESULT_CACHE_WIKI_TTL_SECONDS` (86400),
+    `RESULT_CACHE_CALC_TTL_SECONDS` (604800),
+    `RESULT_CACHE_DEFAULT_TTL_SECONDS` (900).
+  - maintenance (bounded; never touches valid entries by default):
+    `uv run python -m jarvis.maintenance cache stats` — entries / hits /
+    expired / per-tool counts; `cache inspect` — fingerprint-only listing
+    (payloads are never shown); `cache cleanup [--expire-older-than-days N]`
+    — expired rows first, then (with `--yes` or a confirm prompt) rows older
+    than N days, at most 500 per invocation.
+  - the API exposes counts only: `GET /ops/cache/stats` (auth'd) — no
+    fingerprints, no payloads. The dashboard Operations → Result cache
+    section renders the same safe metadata.
+  - **v0.25:** every dispatch also records daily hit/miss/stale/bypass/
+    store counters into `cache_metrics_daily` (same SQLite, per-tool
+    deltas merged atomically), pruned past
+    `RESULT_CACHE_METRICS_RETENTION_DAYS` (default 30). Surfaced via
+    `GET /ops/cache/stats/history?days=&limit=` (aggregates only),
+    `maintenance cache stats` (`today:` counters + per-tool deltas), and
+    the dashboard's Daily cache activity (last 14 days) table. Clients
+    can force fresh runs past the cache: `POST /chat` with
+    `"refresh": true`, CLI `--refresh` / `/refresh`, or the dashboard
+    Refresh-mode toggle. Refresh skips ONLY the cache lookup —
+    permissions, confirmations, and repeat suppression still apply.
+- **Bounded replanning (v0.24)** — a plan step that structurally failed
+  (ERROR result, or a required tool whose every attempt failed) triggers at
+  most ONE validated replan per turn within the remaining tool budget.
+  New log/SSE signals: `plan_step_failed` (now with `reason=`:
+  `step_result_error` or `required_tool_all_attempts_failed`),
+  `replan_triggered`, `replan_validated`, `replan_rejected_empty`,
+  `plan_complete` SSE (complete=bool, failed_steps, replans). A failed
+  replan never masquerades as success: synthesis receives an explicit
+  incompleteness directive and must name the unfinished work.
   `plan_ready` now also carries `quality=` — a deterministic plan-quality
   block (steps, toolless steps, unique/repeated tools, forward references,
   duplicate steps, estimated LLM calls, issues) from

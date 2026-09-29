@@ -86,9 +86,14 @@ class JarvisClient:
         path: str,
         payload: dict[str, Any] | None = None,
         timeout: float | None = None,
+        params: dict[str, Any] | None = None,
     ) -> Any:
         """One JSON request; returns parsed JSON (dict/list) or raises."""
         url = f"{self.base_url}{path}"
+        if params:
+            query = urlencode({k: v for k, v in params.items() if v is not None})
+            if query:
+                url = f"{url}?{query}"
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(url, data=data, headers=self._headers(), method=method)
         try:
@@ -119,15 +124,35 @@ class JarvisClient:
         body = self._request("POST", "/sessions", timeout=DEFAULT_TIMEOUT_CONNECT)
         return body["session_id"]
 
-    def chat(self, message: str, session_id: str | None = None) -> dict[str, Any]:
-        """One turn; auto-creates a session when session_id is omitted."""
+    def chat(
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """One turn; auto-creates a session when session_id is omitted.
+
+        v0.25 ``refresh=True``: programmatic freshness control — cache-eligible
+        read-only retrieval tools skip the cross-turn result cache for THIS
+        turn and execute for real (fresh successful results are re-stored).
+        Affects cache eligibility ONLY: permissions, schema validation and
+        confirmation apply unchanged. Natural-language freshness wording
+        ("latest", "today", …) keeps working independently.
+        """
         payload: dict[str, Any] = {"message": message}
         if session_id:
             payload["session_id"] = session_id
+        if refresh:
+            payload["refresh"] = True
         return self._request("POST", "/chat", payload)
 
     def stream_chat(
-        self, message: str, session_id: str | None = None
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        refresh: bool = False,
     ) -> Iterator[dict[str, Any]]:
         """
         One turn over SSE.
@@ -135,10 +160,15 @@ class JarvisClient:
         Yields dicts: {"event": <name>, "data": <parsed json>}.
         The terminal events are `done` (normal) and `error` (in-band failure);
         a 4xx before streaming (unknown session, rate limit) raises as usual.
+
+        ``refresh=True``: same v0.25 semantics as :meth:`chat` — bypass the
+        cross-turn result cache for this turn (cache eligibility only).
         """
         payload: dict[str, Any] = {"message": message}
         if session_id:
             payload["session_id"] = session_id
+        if refresh:
+            payload["refresh"] = True
         req = urllib.request.Request(
             f"{self.base_url}/chat/stream",
             data=json.dumps(payload).encode("utf-8"),

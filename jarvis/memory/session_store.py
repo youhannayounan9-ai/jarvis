@@ -1362,6 +1362,314 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
+    # ── Knowledge generation (v0.24 cache invalidation) ───────────────────
+
+    def knowledge_generation(self) -> str:
+        """
+        Deterministic generation token for the knowledge DOCUMENT REGISTRY:
+        (row count, chunk sum, latest ingest timestamp). A handful of SQLite
+        aggregates — never a vector-store scan (Part E). Any ingest/reindex/
+        remove changes at least one component, so generation-keyed cache
+        entries go stale exactly when the KB content could have changed.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS docs,
+                       COALESCE(SUM(chunk_count), 0) AS chunks,
+                       COALESCE(MAX(ingested_at), '') AS latest
+                FROM knowledge_documents
+                """
+            ).fetchone()
+        return f"{row['docs']}:{row['chunks']}:{row['latest']}"
+
+    # ── Cross-turn result cache (v0.24) ───────────────────────────────────
+
+    def get_cached_result(
+        self, cache_key: str, session_id: str
+    ) -> dict[str, Any] | None:
+        """
+        Fetch a cache row if it is VISIBLE to this session.
+
+        Isolation (Part C3/Q): 'session'-scoped rows are served only to the
+        session that produced them; 'global' rows are shared. The lookup is
+        one indexed primary-key SELECT.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM result_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        entry = dict(row)
+        if entry.get("scope") == "session" and entry.get("session_id") != session_id:
+            return None  # exists, but belongs to another session
+        return entry
+
+    def put_cached_result(
+        self,
+        *,
+        cache_key: str,
+        tool_name: str,
+        args_json: str,
+        result: str,
+        scope: str,
+        session_id: str | None,
+        expires_at: str | None,
+        source_stat: str | None,
+        kb_generation: str | None,
+        max_entries: int,
+    ) -> None:
+        """
+        Upsert one cache entry, then enforce the entry bound: expired rows
+        are purged first (they are worthless); only if the cap is STILL
+        exceeded are the oldest entries evicted. Valid entries are never
+        deleted merely to make room while any expired row survives
+        (bounded, non-destructive maintenance — Part H).
+        """
+        now = _utcnow()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO result_cache
+                    (cache_key, tool_name, args_json, result, scope, session_id,
+                     created_at, expires_at, source_stat, kb_generation, hit_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    result        = excluded.result,
+                    scope         = excluded.scope,
+                    session_id    = excluded.session_id,
+                    created_at    = excluded.created_at,
+                    expires_at    = excluded.expires_at,
+                    source_stat   = excluded.source_stat,
+                    kb_generation = excluded.kb_generation,
+                    hit_count     = 0
+                """,
+                (cache_key, tool_name, args_json, result, scope, session_id,
+                 now, expires_at, source_stat, kb_generation),
+            )
+            self._conn.execute(
+                "DELETE FROM result_cache WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (now,),
+            )
+            count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM result_cache"
+            ).fetchone()["n"]
+            if count > max_entries:
+                self._conn.execute(
+                    """
+                    DELETE FROM result_cache WHERE cache_key IN (
+                        SELECT cache_key FROM result_cache
+                        ORDER BY created_at ASC, rowid ASC LIMIT ?
+                    )
+                    """,
+                    (count - max_entries,),
+                )
+            self._conn.commit()
+        log.debug("cache_entry_stored", tool=tool_name, cache_key=cache_key)
+
+    def record_cache_hit(self, cache_key: str) -> None:
+        """Bump the hit counter (telemetry only; never affects validity)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE result_cache SET hit_count = hit_count + 1 WHERE cache_key = ?",
+                (cache_key,),
+            )
+            self._conn.commit()
+
+    def delete_cached_result(self, cache_key: str) -> None:
+        """Remove one stale cache entry (called at lookup-time staleness)."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM result_cache WHERE cache_key = ?",
+                (cache_key,),
+            )
+            self._conn.commit()
+
+    def cache_stats(self) -> dict[str, Any]:
+        """Bounded cache telemetry for maintenance/dashboard (Part H/R)."""
+        with self._lock:
+            total, hits, expired = self._conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(hit_count), 0) AS hits,
+                       SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ?
+                                THEN 1 ELSE 0 END) AS expired
+                FROM result_cache
+                """,
+                (_utcnow(),),
+            ).fetchone()
+            per_tool = self._conn.execute(
+                """
+                SELECT tool_name, COUNT(*) AS entries, COALESCE(SUM(hit_count), 0) AS hits
+                FROM result_cache GROUP BY tool_name ORDER BY entries DESC
+                """
+            ).fetchall()
+        return {
+            "entries": int(total),
+            "hits": int(hits),
+            "expired": int(expired or 0),
+            "per_tool": [dict(r) for r in per_tool],
+        }
+
+    def cleanup_result_cache(self, *, expired_only: bool = True, limit: int = 500) -> int:
+        """
+        Bounded explicit cleanup (Part H). Default removes EXPIRED entries
+        only, at most ``limit`` rows per invocation — valid entries are never
+        touched. ``expired_only=False`` additionally evicts the oldest rows
+        (still bounded by ``limit``); used only by the explicit maintenance
+        command, never automatically.
+        """
+        now = _utcnow()
+        with self._lock:
+            if expired_only:
+                cursor = self._conn.execute(
+                    """
+                    DELETE FROM result_cache WHERE cache_key IN (
+                        SELECT cache_key FROM result_cache
+                        WHERE expires_at IS NOT NULL AND expires_at <= ?
+                        ORDER BY expires_at ASC LIMIT ?
+                    )
+                    """,
+                    (now, limit),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """
+                    DELETE FROM result_cache WHERE cache_key IN (
+                        SELECT cache_key FROM result_cache
+                        ORDER BY created_at ASC, rowid ASC LIMIT ?
+                    )
+                    """,
+                    (limit,),
+                )
+            self._conn.commit()
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    # ── Cache metrics history (v0.25, Part E) ─────────────────────────────
+
+    def record_cache_metrics(
+        self,
+        *,
+        hits: int = 0,
+        misses: int = 0,
+        stale: int = 0,
+        bypass: int = 0,
+        stores: int = 0,
+        per_tool: dict[str, dict[str, int]] | None = None,
+    ) -> None:
+        """
+        Increment TODAY'S aggregate cache-operations snapshot (Part E1).
+        ``per_tool`` maps tool name → {hits, misses} deltas. Aggregates only —
+        the caller passes counts, never queries or payloads.
+        """
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        per_tool = per_tool or {}
+        with self._lock:
+            # Read-modify-write merge: per-tool deltas must ACCUMULATE across
+            # same-day records, never replace the stored map.
+            row = self._conn.execute(
+                "SELECT per_tool_json FROM cache_metrics_daily WHERE day = ?",
+                (day,),
+            ).fetchone()
+            merged: dict[str, dict[str, int]] = _json_loads(row[0]) if row else {}
+            for tool, deltas in per_tool.items():
+                bucket = merged.setdefault(str(tool), {})
+                for key, delta in deltas.items():
+                    bucket[str(key)] = bucket.get(str(key), 0) + int(delta)
+            self._conn.execute(
+                """
+                INSERT INTO cache_metrics_daily
+                    (day, hits, misses, stale, bypass, stores, per_tool_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(day) DO UPDATE SET
+                    hits   = hits + excluded.hits,
+                    misses = misses + excluded.misses,
+                    stale  = stale + excluded.stale,
+                    bypass = bypass + excluded.bypass,
+                    stores = stores + excluded.stores,
+                    per_tool_json = excluded.per_tool_json
+                """,
+                (day, hits, misses, stale, bypass, stores,
+                 _json_dumps(merged)),
+            )
+            self._conn.commit()
+        self._prune_cache_metrics()
+
+    def _prune_cache_metrics(self) -> int:
+        """Bounded retention (Part E2): drop rows older than N days."""
+        from datetime import datetime, timedelta, timezone
+
+        retention_days = int(
+            getattr(_settings_ref(), "RESULT_CACHE_METRICS_RETENTION_DAYS", 30)
+        )
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=retention_days)
+        ).strftime("%Y-%m-%d")
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM cache_metrics_daily WHERE day < ?", (cutoff,)
+            )
+            self._conn.commit()
+        return cursor.rowcount or 0
+
+    def cache_metrics_history(
+        self, *, days: int = 30, limit: int = 60
+    ) -> list[dict[str, Any]]:
+        """
+        Bounded history of daily cache-operations aggregates, newest first
+        (Part E3). Merges same-day per-tool deltas; never contains queries,
+        fingerprints, or payloads.
+        """
+        days = max(1, min(int(days), 365))
+        limit = max(1, min(int(limit), 365))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT day, hits, misses, stale, bypass, stores, per_tool_json
+                FROM cache_metrics_daily
+                ORDER BY day DESC LIMIT ?
+                """,
+                (min(days, limit),),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["per_tool"] = _json_loads(entry.pop("per_tool_json") or "{}")
+            except Exception:
+                entry["per_tool"] = {}
+            out.append(entry)
+        return out
+
+    def list_cache_entries(self, *, limit: int = 50, include_expired: bool = True) -> list[dict[str, Any]]:
+        """
+        Metadata-only cache listing for maintenance `cache inspect` (Part H).
+        NEVER returns result payloads — the fingerprint identifies the entry;
+        raw payloads stay reachable only through the runtime itself.
+        """
+        now = _utcnow()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT cache_key, tool_name, args_json, scope, session_id,
+                       created_at, expires_at, hit_count
+                FROM result_cache
+                {where}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """.format(
+                    where=""
+                    if include_expired
+                    else "WHERE expires_at IS NULL OR expires_at > ?"
+                ),
+                (() if include_expired else (now,)) + (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def claim_action_execution(self, action_id: str, owner: str) -> str:
         """
         Atomically claim the single execution attempt for an action.
@@ -1828,6 +2136,41 @@ def _init_db(conn: sqlite3.Connection) -> None:
             ingested_at     TEXT NOT NULL,
             modified_at     TEXT
         );
+
+        -- v0.24: cross-turn result cache for policy-declared READ-ONLY
+        -- retrieval tools. One row per (tool, normalized-args) cache key.
+        -- NEVER holds side-effect or state-coupled tool results (no policy,
+        -- no row). scope='session' rows are only served to their session;
+        -- 'global' rows are public/deterministic content. Errors are never
+        -- stored, so a failed call always re-runs the real tool.
+        CREATE TABLE IF NOT EXISTS result_cache (
+            cache_key     TEXT PRIMARY KEY,
+            tool_name     TEXT NOT NULL,
+            args_json     TEXT NOT NULL,
+            result        TEXT NOT NULL,
+            scope         TEXT NOT NULL,
+            session_id    TEXT,
+            created_at    TEXT NOT NULL,
+            expires_at    TEXT,
+            source_stat   TEXT,
+            kb_generation TEXT,
+            hit_count     INTEGER NOT NULL DEFAULT 0
+        );        CREATE INDEX IF NOT EXISTS idx_result_cache_expires
+            ON result_cache (expires_at);
+
+        -- v0.25 (Part E): bounded daily snapshots of cache OPERATIONS counters
+        -- (hits/misses/stale/bypass/stores, per tool). Aggregates only — never
+        -- queries, fingerprints-of-args, or payloads. Retention is enforced
+        -- at write time (RESULT_CACHE_METRICS_RETENTION_DAYS).
+        CREATE TABLE IF NOT EXISTS cache_metrics_daily (
+            day          TEXT PRIMARY KEY,
+            hits         INTEGER NOT NULL DEFAULT 0,
+            misses       INTEGER NOT NULL DEFAULT 0,
+            stale        INTEGER NOT NULL DEFAULT 0,
+            bypass       INTEGER NOT NULL DEFAULT 0,
+            stores       INTEGER NOT NULL DEFAULT 0,
+            per_tool_json TEXT NOT NULL DEFAULT '{}'
+        );
     """)
     # Lightweight migrations for pre-v0.15 / pre-v0.17 databases —
     # older installations lack these columns; existing data is preserved.
@@ -1873,6 +2216,25 @@ def _init_db(conn: sqlite3.Connection) -> None:
             "ALTER TABLE action_executions ADD COLUMN pause_context_json TEXT"
         )
     conn.commit()
+
+
+def _settings_ref():
+    """Late-bound settings so module import order never matters in helpers."""
+    from jarvis.config import settings as _s
+
+    return _s
+
+
+def _json_dumps(obj: Any) -> str:
+    import json as _json
+
+    return _json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _json_loads(raw: str) -> Any:
+    import json as _json
+
+    return _json.loads(raw)
 
 
 def _utcnow() -> str:

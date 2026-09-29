@@ -14,4 +14,4 @@ The API is the primary service surface; the dashboard consumes it via
 jarvis.api.client, and the CLI embeds the runtime directly.
 """
 
-__version__ = "0.23.0"
+__version__ = "0.25.0"

@@ -24,7 +24,7 @@ File size guard:
 from pathlib import Path
 
 from jarvis.config import settings
-from jarvis.tools.base import BaseTool
+from jarvis.tools.base import BaseTool, CachePolicy
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -61,6 +61,14 @@ class ReadFileTool(BaseTool):
         },
         "required": ["path"],
     }
+    # v0.24 (Part B, Class 3 conditional): the file CONTENT is the freshness
+    # signal — reuse is valid only while the source file's size+mtime are
+    # unchanged (source_stat). Session-scoped: a user's files are private
+    # and must never leak across sessions (Part C3). The stat is a change
+    # SIGNAL only; the real tool still re-validates the path on a miss.
+    cache_policy = CachePolicy(
+        scope="session", freshness="source_stat", normalizer="verbatim"
+    )
 
     def run(self, path: str, **kwargs) -> str:
         allowed_dir = settings.file_reader_allowed_path

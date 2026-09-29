@@ -1,0 +1,801 @@
+{
+  "summary": {
+    "cases_run": 20,
+    "passed": 18,
+    "cache_turn2_hit_rate": "6/6",
+    "freshness_bypass_rate": "4/4",
+    "replans_total": 4,
+    "live_tool_calls": 26,
+    "latency_avg_s": 5.5,
+    "note": "small-sample live check; not statistically universal"
+  },
+  "records": [
+    {
+      "case": "wiki_cross_turn_hit",
+      "rep": 1,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Give me a short summary of Alan Turing from Wikipedia.",
+          "dispatched": [
+            "wikipedia_summary"
+          ],
+          "latency_s": 9.2,
+          "replans": 0,
+          "answer": "Alan Turing was an English mathematician and computer scientist, often referred to as the father of theoretical computer science and artificial intelligence."
+        },
+        {
+          "input": "Give me a short summary of Alan Turing from Wikipedia.",
+          "dispatched": [],
+          "latency_s": 3.5,
+          "replans": 0,
+          "answer": "Alan Turing was an English mathematician and computer scientist, often referred to as the father of theoretical computer science and artificial intelligence."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 1,
+          "hits": 0
+        },
+        "turn2": {
+          "entries": 1,
+          "hits": 1
+        },
+        "turn2_hit": true,
+        "turn2_dispatches": 0
+      },
+      "turn_latency_s": 3.5,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "wiki_cross_turn_hit",
+      "rep": 2,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 0,
+      "turns": [
+        {
+          "input": "Give me a short summary of Alan Turing from Wikipedia.",
+          "dispatched": [],
+          "latency_s": 2.7,
+          "replans": 0,
+          "answer": "Alan Turing was an English mathematician and computer scientist, often referred to as the father of theoretical computer science and artificial intelligence."
+        },
+        {
+          "input": "Give me a short summary of Alan Turing from Wikipedia.",
+          "dispatched": [],
+          "latency_s": 14.8,
+          "replans": 0,
+          "answer": "Alan Turing was an English mathematician and computer scientist, often referred to as the father of theoretical computer science and artificial intelligence."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 1,
+          "hits": 2
+        },
+        "turn2": {
+          "entries": 1,
+          "hits": 3
+        },
+        "turn2_hit": true,
+        "turn2_dispatches": 0
+      },
+      "turn_latency_s": 14.8,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "web_cross_turn_hit",
+      "rep": 1,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [
+            "web_search"
+          ],
+          "latency_s": 3.4,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        },
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [],
+          "latency_s": 2.6,
+          "replans": 0,
+          "answer": "Web search results for: \"LangGraph news\"\n[1] LangGraph adoption grows for agent orchestration\n    URL: https://example.com/langgraph-news\n    Excerpt: LangGraph provides graph-based orchestration with checkpointing.\n\nRecent news about LangGraph highlights its growing adoption for agent orchestration"
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 2,
+          "hits": 3
+        },
+        "turn2": {
+          "entries": 2,
+          "hits": 3
+        },
+        "turn2_hit": true,
+        "turn2_dispatches": 0
+      },
+      "turn_latency_s": 2.6,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "web_cross_turn_hit",
+      "rep": 2,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 0,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [],
+          "latency_s": 2.6,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features like graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        },
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [],
+          "latency_s": 2.8,
+          "replans": 0,
+          "answer": "The latest news on LangGraph focuses on its growing adoption for agent orchestration. The article highlights that LangGraph offers graph-based orchestration with checkpointing capabilities, as reported on [this link](https://example.com/langgraph-news).\n\nLangGraph news highlights its growing adoptio"
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 2,
+          "hits": 4
+        },
+        "turn2": {
+          "entries": 2,
+          "hits": 4
+        },
+        "turn2_hit": true,
+        "turn2_dispatches": 0
+      },
+      "turn_latency_s": 2.8,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "calculator_cross_turn_hit",
+      "rep": 1,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Calculate 893 * 47 with the calculator.",
+          "dispatched": [
+            "calculator"
+          ],
+          "latency_s": 1.6,
+          "replans": 0,
+          "answer": "The result of 893 * 47 is 41971."
+        },
+        {
+          "input": "Calculate 893 * 47 with the calculator.",
+          "dispatched": [],
+          "latency_s": 6.0,
+          "replans": 0,
+          "answer": "The result of 893 * 47 is 41,971."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 3,
+          "hits": 4
+        },
+        "turn2": {
+          "entries": 3,
+          "hits": 5
+        },
+        "turn2_hit": true,
+        "turn2_dispatches": 0
+      },
+      "turn_latency_s": 6.0,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "calculator_cross_turn_hit",
+      "rep": 2,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 0,
+      "turns": [
+        {
+          "input": "Calculate 893 * 47 with the calculator.",
+          "dispatched": [],
+          "latency_s": 2.6,
+          "replans": 0,
+          "answer": "The result of 893 * 47 is 41971."
+        },
+        {
+          "input": "Calculate 893 * 47 with the calculator.",
+          "dispatched": [],
+          "latency_s": 5.0,
+          "replans": 0,
+          "answer": "The result of 893 * 47 is 41,971."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 3,
+          "hits": 6
+        },
+        "turn2": {
+          "entries": 3,
+          "hits": 7
+        },
+        "turn2_hit": true,
+        "turn2_dispatches": 0
+      },
+      "turn_latency_s": 5.0,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "freshness_request_bypasses_cache",
+      "rep": 1,
+      "attempts": [
+        "web_search"
+      ],
+      "dispatched": [
+        "web_search"
+      ],
+      "live_tool_calls": 2,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [
+            "web_search"
+          ],
+          "latency_s": 3.3,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        },
+        {
+          "input": "Search the web for the LATEST LangGraph news and summarize.",
+          "dispatched": [
+            "web_search"
+          ],
+          "latency_s": 4.9,
+          "replans": 0,
+          "answer": "The latest news on LangGraph indicates that it is growing in adoption for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, see the article \"LangGraph adoption grows for agent orchestration\" on example.com."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 4,
+          "hits": 7
+        },
+        "turn2": {
+          "entries": 5,
+          "hits": 7
+        },
+        "turn2_bypassed": true
+      },
+      "turn_latency_s": 4.9,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "freshness_request_bypasses_cache",
+      "rep": 2,
+      "attempts": [
+        "web_search"
+      ],
+      "dispatched": [
+        "web_search"
+      ],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [],
+          "latency_s": 3.7,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        },
+        {
+          "input": "Search the web for the LATEST LangGraph news and summarize.",
+          "dispatched": [
+            "web_search"
+          ],
+          "latency_s": 4.0,
+          "replans": 0,
+          "answer": "Latest LangGraph news highlights the growing adoption of LangGraph for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, you can visit the article at [this link](https://example.com/langgraph-news)."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 5,
+          "hits": 8
+        },
+        "turn2": {
+          "entries": 5,
+          "hits": 6
+        },
+        "turn2_bypassed": true
+      },
+      "turn_latency_s": 4.0,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "incomplete_plan_one_bounded_replan",
+      "rep": 1,
+      "attempts": [
+        "web_search",
+        "calculator",
+        "remember_fact",
+        "calculator"
+      ],
+      "dispatched": [
+        "web_search",
+        "calculator",
+        "remember_fact",
+        "calculator"
+      ],
+      "live_tool_calls": 4,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph orchestration news, then calculate 893 * 47 with the calculator, and remember the result.",
+          "dispatched": [
+            "web_search",
+            "calculator",
+            "remember_fact",
+            "calculator"
+          ],
+          "latency_s": 10.9,
+          "replans": 1,
+          "answer": "I found an article titled \"LangGraph adoption grows for agent orchestration\" on example.com. It mentions that LangGraph provides graph-based orchestration with checkpointing. The result of 893 * 47 is 41971."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 6,
+          "hits": 3
+        }
+      },
+      "calculator_failed_once": true,
+      "turn_latency_s": 10.9,
+      "replans_this_turn": 1,
+      "replans_total": 1,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "incomplete_plan_one_bounded_replan",
+      "rep": 2,
+      "attempts": [
+        "web_search",
+        "calculator",
+        "remember_fact",
+        "calculator"
+      ],
+      "dispatched": [
+        "web_search",
+        "calculator",
+        "remember_fact",
+        "calculator"
+      ],
+      "live_tool_calls": 4,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph orchestration news, then calculate 893 * 47 with the calculator, and remember the result.",
+          "dispatched": [
+            "web_search",
+            "calculator",
+            "remember_fact",
+            "calculator"
+          ],
+          "latency_s": 12.0,
+          "replans": 1,
+          "answer": "I found an article about LangGraph orchestration discussing its adoption for agent orchestration. The product of 893 multiplied by 47 is 41971. I have remembered this result for you."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 7,
+          "hits": 3
+        }
+      },
+      "calculator_failed_once": true,
+      "turn_latency_s": 12.0,
+      "replans_this_turn": 1,
+      "replans_total": 1,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "complete_plan_no_replan",
+      "rep": 1,
+      "attempts": [
+        "remember_fact"
+      ],
+      "dispatched": [
+        "remember_fact"
+      ],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Calculate 893 * 47 with the calculator and then remember the result.",
+          "dispatched": [
+            "remember_fact"
+          ],
+          "latency_s": 5.2,
+          "replans": 0,
+          "answer": "The result of 893 * 47 is 41971."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 7,
+          "hits": 4
+        }
+      },
+      "turn_latency_s": 5.2,
+      "replans_this_turn": 0,
+      "replans_total": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "complete_plan_no_replan",
+      "rep": 2,
+      "attempts": [
+        "remember_fact"
+      ],
+      "dispatched": [
+        "remember_fact"
+      ],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Calculate 893 * 47 with the calculator and then remember the result.",
+          "dispatched": [
+            "remember_fact"
+          ],
+          "latency_s": 4.6,
+          "replans": 0,
+          "answer": "The product of 893 and 47 is 41971. This result has been remembered for future reference."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 7,
+          "hits": 5
+        }
+      },
+      "turn_latency_s": 4.6,
+      "replans_this_turn": 0,
+      "replans_total": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "explicit_refresh_flag_bypasses_cache",
+      "rep": 1,
+      "attempts": [
+        "web_search"
+      ],
+      "dispatched": [
+        "web_search"
+      ],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [],
+          "latency_s": 3.4,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        },
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [
+            "web_search"
+          ],
+          "latency_s": 3.5,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 7,
+          "hits": 6
+        },
+        "turn2": {
+          "entries": 7,
+          "hits": 6
+        },
+        "turn2_bypassed": true
+      },
+      "turn_latency_s": 3.5,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "explicit_refresh_flag_bypasses_cache",
+      "rep": 2,
+      "attempts": [
+        "web_search"
+      ],
+      "dispatched": [
+        "web_search"
+      ],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [],
+          "latency_s": 3.6,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features like graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        },
+        {
+          "input": "Search the web for LangGraph news and summarize.",
+          "dispatched": [
+            "web_search"
+          ],
+          "latency_s": 3.6,
+          "replans": 0,
+          "answer": "LangGraph news highlights its growing adoption for agent orchestration, with features including graph-based orchestration and checkpointing. For more details, see the article at [this link](https://example.com/langgraph-news)."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 7,
+          "hits": 7
+        },
+        "turn2": {
+          "entries": 7,
+          "hits": 7
+        },
+        "turn2_bypassed": true
+      },
+      "turn_latency_s": 3.6,
+      "replans_this_turn": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "grounding_tool_value_overrides_guess",
+      "rep": 1,
+      "attempts": [
+        "calculator"
+      ],
+      "dispatched": [
+        "calculator"
+      ],
+      "live_tool_calls": 1,
+      "turns": [
+        {
+          "input": "Use the calculator tool to compute 8947 * 123457. You MUST call the calculator tool for this \u2014 first say your mental guess, then report the calculator's exact result as the final answer.",
+          "dispatched": [
+            "calculator"
+          ],
+          "latency_s": 8.2,
+          "replans": 0,
+          "answer": "The exact result of 8947 * 123457 is 1,104,569,779."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 8,
+          "hits": 7
+        }
+      },
+      "turn_latency_s": 8.2,
+      "replans_this_turn": 0,
+      "replans_total": 0,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "grounding_tool_value_overrides_guess",
+      "rep": 2,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 0,
+      "turns": [
+        {
+          "input": "Use the calculator tool to compute 8947 * 123457. You MUST call the calculator tool for this \u2014 first say your mental guess, then report the calculator's exact result as the final answer.",
+          "dispatched": [],
+          "latency_s": 4.8,
+          "replans": 0,
+          "answer": "The exact result of 8947 * 123457 is 1,104,569,779."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 8,
+          "hits": 8
+        }
+      },
+      "turn_latency_s": 4.8,
+      "replans_this_turn": 0,
+      "replans_total": 0,
+      "grounded": true,
+      "ok": false,
+      "notes": [
+        "expected the calculator tool to run for real"
+      ]
+    },
+    {
+      "case": "knowledge_step_one_bounded_replan",
+      "rep": 1,
+      "attempts": [
+        "wikipedia_summary",
+        "calculator",
+        "remember_fact",
+        "wikipedia_summary"
+      ],
+      "dispatched": [
+        "wikipedia_summary",
+        "calculator",
+        "remember_fact",
+        "wikipedia_summary"
+      ],
+      "live_tool_calls": 4,
+      "turns": [
+        {
+          "input": "Summarize Alan Turing from Wikipedia, then calculate 12 * 12 with the calculator and remember the result.",
+          "dispatched": [
+            "wikipedia_summary",
+            "calculator",
+            "remember_fact",
+            "wikipedia_summary"
+          ],
+          "latency_s": 11.3,
+          "replans": 1,
+          "answer": "Alan Turing is an English mathematician and computer scientist, often referred to as the father of theoretical computer science and artificial intelligence. The result of 12 * 12 is 144."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 9,
+          "hits": 5
+        }
+      },
+      "wikipedia_summary_failed_once": true,
+      "turn_latency_s": 11.3,
+      "replans_this_turn": 1,
+      "replans_total": 1,
+      "grounded": true,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "knowledge_step_one_bounded_replan",
+      "rep": 2,
+      "attempts": [
+        "wikipedia_summary",
+        "remember_fact",
+        "wikipedia_summary"
+      ],
+      "dispatched": [
+        "wikipedia_summary",
+        "remember_fact",
+        "wikipedia_summary"
+      ],
+      "live_tool_calls": 3,
+      "turns": [
+        {
+          "input": "Summarize Alan Turing from Wikipedia, then calculate 12 * 12 with the calculator and remember the result.",
+          "dispatched": [
+            "wikipedia_summary",
+            "remember_fact",
+            "wikipedia_summary"
+          ],
+          "latency_s": 10.7,
+          "replans": 1,
+          "answer": "Alan Turing was an English mathematician and computer scientist, often referred to as the father of theoretical computer science and artificial intelligence. The result of 12 * 12 is 144."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 9,
+          "hits": 6
+        }
+      },
+      "wikipedia_summary_failed_once": true,
+      "turn_latency_s": 10.7,
+      "replans_this_turn": 1,
+      "replans_total": 1,
+      "grounded": true,
+      "ok": false,
+      "notes": [
+        "expected the calculator tool to run for real"
+      ]
+    },
+    {
+      "case": "no_tool_explanation",
+      "rep": 1,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 0,
+      "turns": [
+        {
+          "input": "Without using any tools: explain in two sentences how plan-and-execute agents differ from ReAct loops.",
+          "dispatched": [],
+          "latency_s": 7.6,
+          "replans": 0,
+          "answer": "Plan-and-execute agents create a plan, execute it, and then evaluate the result to formulate the next plan, iterating until a goal is reached, whereas ReAct loops continuously observe the environment, take actions, and adjust their strategies based on feedback without a predefined initial plan."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 9,
+          "hits": 6
+        }
+      },
+      "turn_latency_s": 7.6,
+      "replans_this_turn": 0,
+      "ok": true,
+      "notes": []
+    },
+    {
+      "case": "no_tool_explanation",
+      "rep": 2,
+      "attempts": [],
+      "dispatched": [],
+      "live_tool_calls": 0,
+      "turns": [
+        {
+          "input": "Without using any tools: explain in two sentences how plan-and-execute agents differ from ReAct loops.",
+          "dispatched": [],
+          "latency_s": 3.8,
+          "replans": 0,
+          "answer": "Plan-and-execute agents create a plan at the start and follow it without re-evaluating choices, whereas ReAct loops observe the environment, take actions, and update their plans based on new information continuously."
+        }
+      ],
+      "cache": {
+        "turn1": {
+          "entries": 9,
+          "hits": 6
+        }
+      },
+      "turn_latency_s": 3.8,
+      "replans_this_turn": 0,
+      "ok": true,
+      "notes": []
+    }
+  ]
+}

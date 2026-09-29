@@ -21,7 +21,7 @@ import re
 from ddgs import DDGS
 from cachetools import TTLCache, cached
 
-from jarvis.tools.base import BaseTool
+from jarvis.tools.base import BaseTool, CachePolicy
 from jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -66,6 +66,11 @@ class WebSearchTool(BaseTool):
         },
         "required": ["query"],
     }
+    # v0.24 (Part B, Class 3 conditional): freshness-sensitive external
+    # retrieval. Short TTL + provenance keeps reuse honest (a hit is labeled
+    # "cached" and the model must not present it as live); requests asking
+    # for latest/current/today bypass the cache entirely (Part L).
+    cache_policy = CachePolicy(scope="global", freshness="ttl", normalizer="generic")
 
     def run(self, query: str, max_results: int = _DEFAULT_MAX_RESULTS, **kwargs) -> str:
         log.info("web_search", query=query, max_results=max_results)

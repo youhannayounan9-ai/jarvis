@@ -379,6 +379,33 @@ def narrow_schemas_for_react(
 
 # ── 4. Unmet-capability detection (honest-refusal reinforcement) ─────────────
 
+# ── 5. Freshness requests (v0.24, Part L) ─────────────────────────
+
+# Explicit freshness vocabulary. When a request contains one of these, the
+# v0.24 cross-turn result cache is BYPASSED for freshness-sensitive tools —
+# a small, auditable word-boundary policy, not a natural-language classifier
+# (Part L: "use a small explicit policy where safe"). Applied only to tools
+# whose policy declares time-based freshness; deterministic tools (calculator)
+# and source-state tools (read_file) don't need it.
+_FRESHNESS_PATTERN = re.compile(
+    r"\b(latest|newest|current|currently|today|tonight|now|right now|real-?time|"
+    r"up[- ]to[- ]date|fresh|breaking|this (?:week|month|year|morning|afternoon|evening)|"
+    r"yesterday|live|so far)\b",
+    re.IGNORECASE,
+)
+
+
+def is_freshness_request(user_input: str) -> bool:
+    """
+    True when the user's request explicitly asks for fresh/current
+    information — such requests bypass cached retrieval (Part D: the user
+    must be able to force fresh retrieval). Conservative by design: a miss
+    just means the normal TTL/freshness machinery decides, never that stale
+    data is served as current.
+    """
+    return bool(_FRESHNESS_PATTERN.search(user_input or ""))
+
+
 def detect_unmet_capability(user_input: str, registry: ToolRegistry) -> str | None:
     """
     When the request names a capability NO registered tool provides, return

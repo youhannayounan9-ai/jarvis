@@ -50,8 +50,8 @@ class ApiBackend:
     def start_session(self) -> str:
         return self._client.create_session()
 
-    def chat(self, session_id: str, message: str) -> str:
-        result = self._client.chat(message, session_id)
+    def chat(self, session_id: str, message: str, refresh: bool = False) -> str:
+        result = self._client.chat(message, session_id, refresh=refresh)
         return result.get("response", "")
 
     def history(self, session_id: str) -> list[dict[str, Any]]:
@@ -103,6 +103,22 @@ class ApiBackend:
     def remove_knowledge_document(self, document_id: str):
         return self._client.remove_knowledge_document(document_id)
 
+    # ── v0.24 result cache ─────────────────────────────────────────────────
+
+    def cache_stats(self) -> dict[str, Any]:
+        return self._client._request("GET", "/ops/cache/stats")
+
+    def cache_history(self, days: int = 14, limit: int = 30) -> list[dict[str, Any]]:
+        """Daily cache-operations aggregates (v0.25 Part E) — counts only."""
+        return self._client._request(
+            "GET",
+            "/ops/cache/stats/history",
+            params={"days": days, "limit": limit},
+        )
+
+    def cache_entries(self, limit: int = 25):
+        raise JarvisClientError(501, "Cache payload inspection is not exposed over the API.")
+
 
 class LegacyBackend:
     """In-process runtime (single-machine fallback; pre-v0.11 behavior)."""
@@ -117,8 +133,8 @@ class LegacyBackend:
     def start_session(self) -> str:
         return self._runtime.start_session()
 
-    def chat(self, session_id: str, message: str) -> str:
-        return self._runtime.chat(session_id, message)
+    def chat(self, session_id: str, message: str, refresh: bool = False) -> str:
+        return self._runtime.chat(session_id, message, refresh=refresh)
 
     def history(self, session_id: str) -> list[dict[str, Any]]:
         return self._runtime.store.load_history(session_id)
@@ -247,6 +263,32 @@ class LegacyBackend:
     def remove_knowledge_document(self, document_id: str):
         return self._kb().remove_document(document_id)
 
+    # ── v0.24 result cache ─────────────────────────────────────────────────
+
+    def cache_stats(self) -> dict[str, Any]:
+        return self._runtime.store.cache_stats()
+
+    def cache_history(self, days: int = 14, limit: int = 30) -> list[dict[str, Any]]:
+        """Daily cache-operations aggregates (v0.25 Part E) — counts only."""
+        return self._runtime.store.cache_metrics_history(days=days, limit=limit)
+
+    def cache_entries(self, limit: int = 25) -> list[dict[str, Any]]:
+        from jarvis.memory.session_store import _parse_ts
+
+        rows = self._runtime.store.list_cache_entries(limit=limit)
+        import time as _time
+
+        for r in rows:
+            try:
+                age = max(0.0, _time.time() - _parse_ts(str(r["created_at"])).timestamp())
+            except Exception:
+                age = None
+            r["age_human"] = (
+                f"{int(age // 60)}m" if age is not None and age < 86400
+                else (f"{int(age // 86400)}d" if age is not None else "?")
+            )
+        return rows
+
 
 @st.cache_resource
 def get_backend() -> Any:
@@ -312,7 +354,7 @@ def _render_ops(backend: Any, current_session: str) -> None:
 
     section = st.radio(
         "Section",
-        ["Recent actions", "UNKNOWN actions", "Session leases", "Session timeline", "Plan status"],
+        ["Recent actions", "UNKNOWN actions", "Session leases", "Session timeline", "Plan status", "Result cache"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -559,8 +601,99 @@ def _render_ops(backend: Any, current_session: str) -> None:
                 st.caption(
                     "Plan step state is derived from persisted actions; live "
                     "per-step telemetry is in the structured logs "
-                    "(plan_validated / plan_step_satisfied / plan_completed)."
+                    "(plan_validated / plan_step_satisfied / plan_step_failed / "
+                    "replan_triggered / plan_completed / replan_diff — v0.25 "
+                    "replan_diff logs the structural shape of each replan: "
+                    "steps added/removed and capabilities changed, never "
+                    "arguments or results)."
                 )
+
+    # ── Result cache (v0.24) ─────────────────────────────────────────────
+    elif section == "Result cache":
+        """Cross-turn reuse indicators: hits, expired entries, per-tool
+        counts, and a metadata-only listing. Payloads are never shown —
+        cached content is reachable only through the runtime's own
+        permission-guarded dispatch path (Part R/Q)."""
+        stats, err = _safe(backend.cache_stats, "loading cache stats")
+        if err is None and stats is not None:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Cached entries", stats["entries"])
+            c2.metric("Total hits", stats["hits"])
+            c3.metric("Expired", stats["expired"])
+            if stats["per_tool"]:
+                st.dataframe(
+                    [
+                        {
+                            "tool": row["tool_name"],
+                            "entries": row["entries"],
+                            "hits": row["hits"],
+                        }
+                        for row in stats["per_tool"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("The result cache is empty — run a retrieval-backed request first.")
+
+            # v0.25 (Part E4): bounded daily aggregates — counts only, no
+            # payloads. Newest first from the store; shown oldest→newest so
+            # the trend reads naturally.
+            history_rows, herr = _safe(
+                lambda: backend.cache_history(days=14, limit=30),
+                "loading cache metrics history",
+            )
+            if herr is None and history_rows is not None:
+                if history_rows:
+                    st.markdown("**Daily cache activity (last 14 days)**")
+                    st.dataframe(
+                        [
+                            {
+                                "day": row["day"],
+                                "hits": row["hits"],
+                                "misses": row["misses"],
+                                "stale": row["stale"],
+                                "bypass": row["bypass"],
+                                "stores": row["stores"],
+                                "top tools": ", ".join(
+                                    sorted(row.get("per_tool", {}).keys())
+                                ) or "—",
+                            }
+                            for row in reversed(history_rows)
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No cache activity recorded yet.")
+
+            st.caption(
+                "Cross-turn reuse for read-only retrieval only (never side "
+                "effects). Cached answers carry a provenance header; a request "
+                "saying 'latest' — or Refresh mode in the sidebar — bypasses "
+                "time-sensitive cache entries. Retention is bounded (default "
+                "30 days). Inspect/cleanup via CLI: "
+                "`maintenance cache stats|inspect|cleanup`."
+            )
+            if backend.mode == "legacy":
+                entries, err2 = _safe(
+                    lambda: backend.cache_entries(25), "loading cache entries"
+                )
+                if err2 is None and entries:
+                    st.dataframe(
+                        [
+                            {
+                                "fingerprint": r["cache_key"][:12] + "…",
+                                "tool": r["tool_name"],
+                                "scope": r["scope"],
+                                "hits": r["hit_count"],
+                                "age": r.get("age_human", "?"),
+                            }
+                            for r in entries
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
 
 def _render_knowledge(backend: Any) -> None:
@@ -688,6 +821,21 @@ view = st.sidebar.radio(
 
 st.sidebar.markdown("### Active Session")
 st.sidebar.caption(f"Session ID: `{st.session_state.session_id[:8]}...`")
+
+# v0.25 (Part D3): per-session programmatic refresh. Affects cache
+# ELIGIBILITY only — permissions, schema validation and confirmations are
+# unchanged.
+refresh_mode = st.sidebar.toggle(
+    "Refresh mode (bypass cache)",
+    value=False,
+    help=(
+        "When ON, chat turns are sent with refresh=True: eligible cached "
+        "results are re-fetched instead of served. Permissions, validation "
+        "and confirmations are unaffected. Natural-language freshness words "
+        "like 'latest' work without this toggle."
+    ),
+)
+st.session_state["refresh_mode"] = refresh_mode
 try:
     msg_count = backend.message_count(st.session_state.session_id)
 except Exception as e:
@@ -759,7 +907,11 @@ if user_input := st.chat_input("How can I help you?"):
     with st.chat_message("assistant"):
         with st.spinner("JARVIS is planning and executing..."):
             try:
-                response = backend.chat(st.session_state.session_id, user_input)
+                response = backend.chat(
+                    st.session_state.session_id,
+                    user_input,
+                    refresh=bool(st.session_state.get("refresh_mode")),
+                )
                 st.markdown(response)
             except Exception as e:
                 st.error(f"Error: {e}")

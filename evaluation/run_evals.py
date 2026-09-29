@@ -38,6 +38,8 @@ How to add new cases:
       - 'grader': name of a custom response grader (see _GRADERS).
 """
 
+
+
 import hashlib
 import json
 import platform
@@ -45,6 +47,12 @@ import sys
 import time
 from typing import Any
 from unittest.mock import patch
+
+# ISOLATION (v0.25 Part G): run against a private temp DB — never the
+# real jarvis.db (cross-turn cache entries would leak across runs).
+from evaluation import _bootstrap as _eval
+
+_eval.isolate()
 
 from jarvis.core.orchestrator import Orchestrator
 from jarvis.core.permissions import PermissionGuard

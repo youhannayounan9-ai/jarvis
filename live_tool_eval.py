@@ -32,7 +32,15 @@ Run (NOT part of pytest; requires Ollama with the configured model):
     uv run python live_tool_eval.py --model llava:latest --arm v021 --reps 1
 """
 
+
+
 from __future__ import annotations
+
+# ISOLATION (v0.25 Part G): run against a private temp DB — never the
+# real jarvis.db (cross-turn cache entries would leak across runs).
+from evaluation import _bootstrap as _eval
+
+_eval.isolate()
 
 import argparse
 import json
