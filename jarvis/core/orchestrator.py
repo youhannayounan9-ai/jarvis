@@ -24,6 +24,13 @@ from jarvis.config import settings
 from jarvis.core.permissions import PermissionGuard
 from jarvis.core.planner import Planner
 from jarvis.core.dispatch_guard import DispatchLedger
+# v0.26 (Part 3/5/6): deterministic post-synthesis grounding guard. The
+# guard is a pure function of (answer, evidence) — same inputs, same verdict.
+from jarvis.core.grounding import (
+    check_grounding,
+    build_correction_prompt,
+    build_fallback_answer,
+)
 from jarvis.core.plan_quality import report_plan_quality
 from jarvis.core.plan_validator import validate_plan
 from jarvis.core.result_cache import ResultCache
@@ -358,6 +365,7 @@ class Orchestrator:
             # deterministic fallback) — harvest evidence the same way so its
             # tool-free wrap-up call sees the same authoritative contract.
             fast_observations: list[str] = []
+            fast_observation_tools: list[str] = []
             fast_evidence: list[dict[str, Any]] = []
             final_text, _ = self._run_react(
                 session_id=session_id,
@@ -367,6 +375,7 @@ class Orchestrator:
                 min_rounds=1 if force_tool_round else 0,
                 on_event=on_event,
                 tool_observations=fast_observations,
+                tool_observation_tools=fast_observation_tools,
                 pause_context={
                     # Fast-path turns park too: the approved action IS the
                     # whole task, so resume goes straight to synthesis.
@@ -378,14 +387,19 @@ class Orchestrator:
                     "remaining_rounds": 2,
                 },
             )
-            for obs in fast_observations:
+            for i, obs in enumerate(fast_observations):
                 if not _is_tool_error(str(obs)):
-                    fast_evidence.append({
-                        "step_number": 1,
-                        "tool": _tool_from_observation(str(obs)),
-                        "status": "ok",
-                        "result": str(obs),
-                    })
+                    fast_evidence.append(
+                        _evidence_item_from_observation(
+                            str(obs),
+                            1,
+                            real_tool=(
+                                fast_observation_tools[i]
+                                if i < len(fast_observation_tools)
+                                else None
+                            ),
+                        )
+                    )
             if fast_evidence:
                 # One tool-free grounded wrap-up when tools actually ran: the
                 # model's earlier prose in `final_text` is NOT authoritative
@@ -463,6 +477,10 @@ class Orchestrator:
         # v0.22 (Part E): exact clamped tool evidence carried across steps so
         # a later step can quote real values, not an earlier step's prose.
         step_observations: list[str] = []
+        # v0.26: the REAL tool name for each observation (same order) — the
+        # evidence ledger is attributed at the dispatch site, not by parsing
+        # result text (production results carry no tool name).
+        step_observation_tools: list[str] = []
         # v0.25 (Part B): the AUTHORITATIVE evidence ledger for synthesis —
         # successful tool observations with their owning step and tool, in
         # execution order. Replan observations append to the same ledger, so
@@ -481,6 +499,7 @@ class Orchestrator:
             completed_steps=completed_steps,
             completed_descriptions=completed_descriptions,
             step_observations=step_observations,
+            step_observation_tools=step_observation_tools,
             evidence_ledger=synthesis_evidence,
             remaining_rounds=remaining_rounds,
             on_event=on_event,
@@ -581,6 +600,7 @@ class Orchestrator:
                     completed_steps=completed_steps,
                     completed_descriptions=retry_descriptions,
                     step_observations=step_observations,
+                    step_observation_tools=step_observation_tools,
                     evidence_ledger=synthesis_evidence,
                     remaining_rounds=remaining_rounds,
                     on_event=on_event,
@@ -647,6 +667,7 @@ class Orchestrator:
         completed_steps: list[dict[str, Any]],
         completed_descriptions: set[str],
         step_observations: list[str],
+        step_observation_tools: list[str] | None = None,
         evidence_ledger: list[dict[str, Any]] | None = None,
         remaining_rounds: int,
         on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -745,6 +766,7 @@ class Orchestrator:
                 min_rounds=1 if step.get("required_tools") else 0,
                 on_event=on_event,
                 tool_observations=step_observations,
+                tool_observation_tools=step_observation_tools,
                 pause_context={
                     "original_request": user_input,
                     "memory_cue": memory_cue,
@@ -777,16 +799,20 @@ class Orchestrator:
             # earlier one (Part B2). Bounded by the clamp the observation
             # already went through.
             if evidence_ledger is not None:
-                for obs in step_observations[obs_start:]:
+                for i, obs in enumerate(step_observations[obs_start:]):
                     if _is_tool_error(str(obs)):
                         continue
-                    synthesis_evidence_item = {
-                        "step_number": step_number,
-                        "tool": _tool_from_observation(str(obs)),
-                        "status": "ok",
-                        "result": str(obs),
-                    }
-                    evidence_ledger.append(synthesis_evidence_item)
+                    real_tool = (
+                        step_observation_tools[obs_start + i]
+                        if step_observation_tools is not None
+                        and obs_start + i < len(step_observation_tools)
+                        else None
+                    )
+                    evidence_ledger.append(
+                        _evidence_item_from_observation(
+                            str(obs), step_number, real_tool=real_tool
+                        )
+                    )
 
             completed_steps.append({
                 "step_number": step_number,
@@ -1154,12 +1180,19 @@ class Orchestrator:
         tool_schemas = self._registry.get_schemas()
         # v0.22 (Part E): rebuild the observation ledger from completed steps'
         # tool messages (persisted in the store) so resumed steps keep the
-        # same exact-evidence flow as a non-paused turn.
-        step_observations: list[str] = [
-            self._context.clamp_tool_output(str(m.get("content") or ""))
-            for m in history
-            if m.get("role") == "tool" and not _is_tool_error(str(m.get("content") or ""))
-        ]
+        # same exact-evidence flow as a non-paused turn. v0.26: the REAL tool
+        # name rides along (persisted on each tool message) for evidence
+        # attribution.
+        step_observation_tools: list[str] = []
+        step_observations: list[str] = []
+        for m in history:
+            if m.get("role") != "tool" or _is_tool_error(str(m.get("content") or "")):
+                continue
+            step_observations.append(
+                self._context.clamp_tool_output(str(m.get("content") or ""))
+            )
+            name = str(m.get("name") or "").strip()
+            step_observation_tools.append(name or "tool")
 
         # The paused step's outcome (approval result, denial, or tool error)
         # becomes a completed step so synthesis and later steps can use it.
@@ -1230,6 +1263,7 @@ class Orchestrator:
                     "mode": mode,
                 },
                 tool_observations=step_observations,
+                tool_observation_tools=step_observation_tools,
             )
             if step_result == PAUSED_FOR_CONFIRMATION:
                 log.info("turn_paused_again_during_resume", session_id=session_id, step=step_number)
@@ -1245,6 +1279,23 @@ class Orchestrator:
                 break
 
         # ── Final synthesis over the whole (original + resumed) task ────────
+        # v0.26: rebuild the authoritative evidence ledger from the persisted
+        # tool messages — resume previously synthesized with NO evidence, so
+        # the grounding guard (and the evidence contract) never ran on these
+        # turns. Same success-only filter as step_observations above; real
+        # tool names come from the persisted tool messages.
+        resume_evidence = [
+            _evidence_item_from_observation(
+                obs,
+                0,
+                real_tool=(
+                    step_observation_tools[i]
+                    if i < len(step_observation_tools)
+                    else None
+                ),
+            )
+            for i, obs in enumerate(step_observations)
+        ]
         if mode == "simple" and not remaining:
             # Fast-path turn: the approved/denied action WAS the whole task.
             # The tool/denial message is already in history; one tool-free
@@ -1255,6 +1306,7 @@ class Orchestrator:
                 memory_cue=memory_cue,
                 history=history,
                 completed_steps=completed_steps,
+                evidence=resume_evidence or None,
             )
 
         return self._synthesize(
@@ -1263,9 +1315,144 @@ class Orchestrator:
             memory_cue=memory_cue,
             history=history,
             completed_steps=completed_steps,
+            evidence=resume_evidence or None,
         )
 
-    # ── Step helpers ───────────────────────────────────────────────────────────
+    # ── v0.26: grounding guard + ONE bounded correction round ────────────
+
+    def _enforce_grounding(
+        self,
+        *,
+        session_id: str,
+        initial_text: str,
+        base_messages: list[dict[str, Any]],
+        synthesis_block: str,
+        evidence: list[dict[str, Any]] | None,
+        memory_cue: str,
+        history: list[dict[str, Any]],
+        user_input: str,
+        completed_steps: list[dict[str, Any]],
+        incomplete_note: str | None,
+    ) -> str:
+        """
+        Deterministic post-synthesis answer integrity (v0.26 Parts 3/5/6).
+
+        Layering:
+          1. ``check_grounding`` (pure, no model) over the final answer and
+             the turn's trusted evidence. Low confidence NEVER rejects — a
+             missed catch is acceptable, a false rejection is not.
+          2. On a high-confidence contradiction: EXACTLY ONE correction round
+             — the trusted evidence is restated and the model is explicitly
+             told to transcribe it, not recompute (temperature still 0.0).
+          3. If the corrected answer still contradicts: fail-closed fallback
+             that preserves the authoritative value and states plainly that
+             the generated answer was withheld. Never silent acceptance,
+             never fabricated content, never a second correction round.
+
+        The kill switch ``JARVIS_DISABLE_GROUNDING_GUARD=true`` restores
+        exact v0.25 behavior (test-pinned). Any guard failure degrades to
+        the ordinary answer — answer delivery must never break.
+        """
+        if settings.JARVIS_DISABLE_GROUNDING_GUARD:
+            return initial_text
+        try:
+            verdict = check_grounding(initial_text, evidence)
+        except Exception as e:  # noqa: BLE001 - availability over purity
+            log.warning("grounding_check_failed", session_id=session_id, error=str(e))
+            return initial_text
+
+        if not verdict.checked:
+            return initial_text
+        self._store.record_grounding_metrics(checks=1)
+        log.info(
+            "grounding_check_started",
+            session_id=session_id,
+            evidence_items=len(evidence or []),
+        )
+
+        if verdict.ok:
+            log.info("grounding_check_passed", session_id=session_id)
+            return initial_text
+
+        # ── Contradiction: telemetry, SSE, ONE bounded correction ──────────
+        detail = verdict.details[0]
+        log.warning(
+            "grounding_contradiction_detected",
+            session_id=session_id,
+            policy=detail.get("policy"),
+            tool=detail.get("tool"),
+            source=detail.get("source"),
+            evidence_type=detail.get("evidence_type"),
+        )
+
+        correction_messages = list(base_messages)
+        correction_messages.append({
+            "role": "user",
+            "content": (
+                f"{synthesis_block}\n\n{build_correction_prompt(verdict.details)}"
+            ),
+        })
+        try:
+            log.info(
+                "grounding_correction_started",
+                session_id=session_id,
+                attempt=1,
+                max_attempts=1,
+            )
+            correction = chat_completion(
+                messages=correction_messages, tools=None, temperature=0.0
+            )
+            corrected_text = (
+                correction.choices[0].message.content
+                or "I ran into an issue completing that request."
+            )
+        except Exception as e:  # noqa: BLE001 - correction is best-effort
+            log.warning("grounding_correction_llm_failed", session_id=session_id, error=str(e))
+            corrected_text = None
+
+        second_verdict = None
+        if corrected_text is not None:
+            try:
+                second_verdict = check_grounding(corrected_text, evidence)
+            except Exception as e:  # noqa: BLE001
+                log.warning("grounding_recheck_failed", session_id=session_id, error=str(e))
+                second_verdict = None
+            if second_verdict is not None and second_verdict.ok:
+                self._store.record_grounding_metrics(
+                    checks=1, contradictions=1, corrections=1, corrections_ok=1
+                )
+                log.info(
+                    "grounding_correction_passed",
+                    session_id=session_id,
+                    attempt=1,
+                )
+                return corrected_text
+
+        # ── Fail-closed: correction failed, errored, or is un-checkable ────
+        # A correction whose verdict is UNKNOWN (guard exception) is NOT
+        # trusted either — only a verified-consistent answer passes.
+        self._store.record_grounding_metrics(
+            checks=1,
+            contradictions=1,
+            corrections=0 if corrected_text is None else 1,
+            corrections_failed=1,
+            fallbacks=1,
+        )
+        log.warning(
+            "grounding_correction_failed",
+            session_id=session_id,
+            attempt=1,
+            verified=bool(second_verdict is not None and not second_verdict.contradiction),
+        )
+        log.warning(
+            "grounding_fallback_used",
+            session_id=session_id,
+            policy=detail.get("policy"),
+            tool=detail.get("tool"),
+        )
+        return build_fallback_answer(verdict.details)
+
+    # ── Step helpers ──────────────────────────────────────────────────────
 
     def _build_step_messages(
         self,
@@ -1332,6 +1519,7 @@ class Orchestrator:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         pause_context: dict[str, Any] | None = None,
         tool_observations: list[str] | None = None,
+        tool_observation_tools: list[str] | None = None,
     ) -> tuple[str, int]:
         """
         Mini ReAct loop for a single plan step.
@@ -1340,6 +1528,11 @@ class Orchestrator:
         result is appended to it so the CALLER can propagate exact evidence
         to later steps (a later step must not depend on how verbosely the
         model summarized an earlier step).
+
+        v0.26: ``tool_observation_tools`` (when given) receives the REAL tool
+        name for every observation appended to ``tool_observations`` —
+        evidence attribution comes from the dispatch site, not from parsing
+        the result text (which usually carries no tool name).
 
         Includes a self-correction sub-loop: when a tool returns an error, the
         loop feeds the observation back to the LLM and grants up to
@@ -1480,6 +1673,8 @@ class Orchestrator:
                 # v0.22: raw evidence for later steps (bounded by the clamp).
                 if tool_observations is not None:
                     tool_observations.append(str(active_content))
+                    if tool_observation_tools is not None:
+                        tool_observation_tools.append(str(tc.function.name))
 
             # ── Pause propagation ────────────────────────────────────────────────
             if paused:
@@ -1561,7 +1756,9 @@ class Orchestrator:
             (durable confirmation parked, or guard blocked), or None when the
             dispatch may proceed.
         """
-        risk_level = self._registry.get_tool_risk_level(tool_name)
+        # v0.28: args-dependent effective risk (browser actions) — same
+        # escalation contract as the async path: only ESCALATE, never widen.
+        risk_level = self._registry.effective_risk_level(tool_name, tool_args)
 
         if getattr(settings, "REQUIRE_CONFIRMATION_FOR_HIGH_RISK", False) and self._guard.require_confirmation(tool_name, risk_level):
             log.warning(
@@ -1754,8 +1951,14 @@ class Orchestrator:
         never marks anything approved. Failed results are never recorded,
         so retry-after-failure remains legitimate (Part K); state-dependent
         tools are exempt by class.
+
+        v0.28: the risk level is args-dependent for browser actions
+        (``effective_risk_level``); a click worded "Submit order" escalates
+        NETWORK → SYSTEM and parks for user confirmation through the SAME
+        durable flow as every other protected action. Dynamic risk can only
+        ESCALATE, never widen.
         """
-        risk_level = self._registry.get_tool_risk_level(tool_name)
+        risk_level = self._registry.effective_risk_level(tool_name, tool_args)
 
         if getattr(settings, "REQUIRE_CONFIRMATION_FOR_HIGH_RISK", False) and self._guard.require_confirmation(tool_name, risk_level):
             log.warning(
@@ -1928,12 +2131,37 @@ class Orchestrator:
         # temperature). Low temperature, deterministic when the platform honors it.
         response = chat_completion(messages=messages, tools=None, temperature=0.0)
         assistant_message = response.choices[0].message
-        assistant_dict = _message_to_dict(assistant_message)
-        self._store.save_message(session_id, assistant_dict)
-        return (
+        text = (
             assistant_message.content
             or "I ran into an issue completing that request."
         )
+        # v0.26 (Parts 3/5/6): DETERMINISTIC GROUNDING GUARD. The v0.25 live
+        # evidence proved an instruction is not a guarantee — the model can
+        # still emit a value contradicting the tool. The guard inspects the
+        # final answer against the trusted evidence ledger and, on a
+        # HIGH-CONFIDENCE contradiction, runs EXACTLY ONE bounded correction
+        # round; if that still contradicts, a truthful fail-closed fallback
+        # preserving the authoritative value is returned instead. The normal
+        # path pays one pure-Python check (microseconds) and never a second
+        # model call.
+        text = self._enforce_grounding(
+            session_id=session_id,
+            initial_text=text,
+            base_messages=messages,
+            synthesis_block=f"{synthesis_block}\n\n{final_instruction}",
+            evidence=evidence,
+            memory_cue=memory_cue,
+            history=history,
+            user_input=user_input,
+            completed_steps=completed_steps,
+            incomplete_note=incomplete_note,
+        )
+        # The FINAL text (corrected or fallback included) is what persists —
+        # the stored assistant message must match what the user saw.
+        assistant_dict = _message_to_dict(assistant_message)
+        assistant_dict["content"] = text
+        self._store.save_message(session_id, assistant_dict)
+        return text
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -1984,6 +2212,41 @@ def _format_completed_steps(completed_steps: list[dict[str, Any]]) -> str:
 _MAX_EVIDENCE_ITEMS = 16
 _MAX_EVIDENCE_ITEM_CHARS = 1200
 
+_CACHED_HEADER_CAPTURE = re.compile(
+    r"^\[cached result:\s*retrieved\s+(?P<age>[^\]]+?)\s+ago\s+via\s+"
+    r"(?P<tool>[\w_]+)",
+    re.IGNORECASE,
+)
+
+
+def _evidence_item_from_observation(
+    observation: str,
+    step_number: int,
+    *,
+    real_tool: str | None = None,
+) -> dict[str, Any]:
+    """
+    v0.26 (Part 2): one evidence-ledger item from a SUCCESSFUL observation.
+
+    ``real_tool`` is the dispatch-site tool name (ground truth); the
+    text-heuristic attribution is only a fallback for paths without one. A
+    v0.24 cache-provenance header in the observation is promoted to explicit
+    ``source``/``cached_age`` fields — cache-provenance detection then never
+    depends on header parsing downstream. The header itself stays in ``result``
+    (it is visible provenance for the model, not a secret).
+    """
+    item: dict[str, Any] = {
+        "step_number": step_number,
+        "tool": real_tool or _tool_from_observation(observation),
+        "status": "ok",
+        "result": str(observation),
+    }
+    header = _CACHED_HEADER_CAPTURE.match(str(observation))
+    if header:
+        item["source"] = "cache"
+        item["cached_age"] = header.group("age").strip()
+    return item
+
 
 def _tool_from_observation(observation: str) -> str:
     """Best-effort tool name from a stored observation line.
@@ -1993,7 +2256,15 @@ def _tool_from_observation(observation: str) -> str:
     own result text (e.g. ``Result: 41971``) with no name. Attribution here is
     therefore best-effort and used ONLY for evidence labeling — never for
     authorization or execution decisions.
+
+    v0.26: a v0.24 cache provenance header (``[cached result: retrieved 3m
+    ago via calculator …]``) is stripped first and its tool name used —
+    cached evidence keeps its tool attribution and its provenance header is
+    DATA, not part of the tool's output.
     """
+    observation = re.sub(
+        r"^\[cached result:[^\]]*\]\s*", "", str(observation), flags=re.IGNORECASE
+    )
     prefix = observation.split(":", 1)[0].strip()
     # Registry-probe observations record successes as ``'<tool> ok: <args>'``;
     # strip the trailing ' ok' so the label is the tool name.

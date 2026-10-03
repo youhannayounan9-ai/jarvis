@@ -1262,6 +1262,509 @@ class SessionStore:
         events.sort(key=lambda e: (str(e.get("ts") or ""), int(e.get("seq") or 0)))
         return events[-limit:]
 
+    # ── v0.29: integration accounts + external-action audit (read/write) ────
+
+    def upsert_integration_account(
+        self,
+        *,
+        account_id: str,
+        provider: str,
+        display_label: str,
+        scopes: frozenset[str],
+        credential_obfuscated: str,
+        credential_fingerprint: str,
+        provider_account_ref: str,
+        auth_state: str,
+        granted_at: str,
+    ) -> None:
+        """Insert or refresh one connected account row (one tx)."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO integration_accounts
+                    (account_id, provider, display_label, scopes_json,
+                     credential_obfuscated, credential_fingerprint,
+                     provider_account_ref, auth_state, granted_at, last_verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    provider              = excluded.provider,
+                    display_label         = excluded.display_label,
+                    scopes_json           = excluded.scopes_json,
+                    credential_obfuscated = excluded.credential_obfuscated,
+                    credential_fingerprint = excluded.credential_fingerprint,
+                    provider_account_ref  = excluded.provider_account_ref,
+                    auth_state            = excluded.auth_state,
+                    granted_at            = excluded.granted_at,
+                    last_verified_at      = NULL
+                """,
+                (
+                    account_id, provider, display_label,
+                    _json_dumps(sorted(scopes)), credential_obfuscated,
+                    credential_fingerprint, provider_account_ref, auth_state,
+                    granted_at,
+                ),
+            )
+            self._conn.commit()
+        log.info(
+            "integration_account_upserted",
+            provider=provider,
+            account_id=account_id,
+            auth_state=auth_state,
+        )
+
+    def get_integration_account(self, account_id: str) -> dict[str, Any] | None:
+        """One account ROW (including the obfuscated credential column).
+
+        Store-level method only — callers above the integration manager must
+        use the manager's ConnectedAccount projection, which never carries
+        the credential in readable form and never reprs it.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM integration_accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_integration_account_by_label(
+        self, provider: str, display_label: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM integration_accounts
+                 WHERE provider = ? AND display_label = ?
+                """,
+                (provider, display_label),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_integration_accounts(self, provider: str | None = None) -> list[dict[str, Any]]:
+        """Bounded newest-first account rows (full rows — manager-gated)."""
+        with self._lock:
+            if provider is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM integration_accounts
+                     ORDER BY granted_at DESC, rowid DESC LIMIT 100
+                    """
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM integration_accounts
+                     WHERE provider = ?
+                     ORDER BY granted_at DESC, rowid DESC LIMIT 100
+                    """,
+                    (provider,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_integration_account(self, account_id: str) -> bool:
+        """Remove one connected account. True when it existed."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM integration_accounts WHERE account_id = ?",
+                (account_id,),
+            )
+            self._conn.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            log.info("integration_account_deleted", account_id=account_id)
+        return deleted
+
+    def update_integration_account_auth(
+        self, account_id: str, auth_state: str, last_verified_at: str | None
+    ) -> None:
+        """Persist a verification result for one account (Part 3)."""
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE integration_accounts
+                   SET auth_state = ?, last_verified_at = ?
+                 WHERE account_id = ?
+                """,
+                (auth_state, last_verified_at, account_id),
+            )
+            self._conn.commit()
+
+    def upsert_oauth_account(
+        self,
+        *,
+        account_id: str,
+        provider: str,
+        display_label: str,
+        scopes: frozenset[str],
+        credential_obfuscated: str,
+        credential_fingerprint: str,
+        provider_account_ref: str,
+        granted_at: str,
+        authorization_status: str,
+        token_access_obfuscated: str,
+        token_refresh_obfuscated: str,
+        token_expires_at: str,
+        token_updated_at: str,
+        auth_state: str,
+    ) -> None:
+        """
+        v0.30: ONE-TRANSACTION insert-or-rotate of an OAuth account (new
+        authorization or re-authorization of an existing label). Every
+        token column is written together with the identity/scopes so a
+        crash can never pair new tokens with stale scopes.
+        """
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO integration_accounts
+                    (account_id, provider, display_label, scopes_json,
+                     credential_obfuscated, credential_fingerprint,
+                     provider_account_ref, auth_state, granted_at, last_verified_at,
+                     authorization_status, token_access_obfuscated,
+                     token_refresh_obfuscated, token_expires_at, token_updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    provider              = excluded.provider,
+                    display_label         = excluded.display_label,
+                    scopes_json           = excluded.scopes_json,
+                    credential_obfuscated = excluded.credential_obfuscated,
+                    credential_fingerprint = excluded.credential_fingerprint,
+                    provider_account_ref  = excluded.provider_account_ref,
+                    auth_state            = excluded.auth_state,
+                    last_verified_at      = NULL,
+                    authorization_status  = excluded.authorization_status,
+                    token_access_obfuscated = excluded.token_access_obfuscated,
+                    token_refresh_obfuscated = excluded.token_refresh_obfuscated,
+                    token_expires_at      = excluded.token_expires_at,
+                    token_updated_at      = excluded.token_updated_at
+                """,
+                (
+                    account_id, provider, display_label,
+                    _json_dumps(sorted(scopes)), credential_obfuscated,
+                    credential_fingerprint, provider_account_ref, auth_state,
+                    granted_at, authorization_status, token_access_obfuscated,
+                    token_refresh_obfuscated, token_expires_at, token_updated_at,
+                ),
+            )
+            self._conn.commit()
+        log.info(
+            "integration_oauth_account_upserted",
+            provider=provider,
+            account_id=account_id,
+            authorization_status=authorization_status,
+        )
+
+    def record_integration_audit(
+        self,
+        *,
+        provider: str,
+        account_id: str,
+        operation: str,
+        resource_kind: str,
+        risk_category: str,
+        request_id: str,
+        state: str,
+        resource_id: str | None = None,
+        idempotency_key: str | None = None,
+        verification: str = "NOT_APPLICABLE",
+        result_summary: str | None = None,
+    ) -> None:
+        """Append one EXTERNAL side-effect audit row (Part 13).
+
+        ``result_summary`` must be pre-sanitized and bounded by the caller
+        (the manager does both); this method never stores raw payloads.
+        """
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO integration_audit
+                    (ts, provider, account_id, operation, resource_kind,
+                     resource_id, risk_category, request_id, idempotency_key,
+                     state, verification, result_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _utcnow(), provider, account_id, operation, resource_kind,
+                    resource_id, risk_category, request_id, idempotency_key,
+                    state, verification, result_summary,
+                ),
+            )
+            self._conn.commit()
+
+    def list_integration_audit(
+        self,
+        *,
+        account_id: str | None = None,
+        provider: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Bounded newest-first external-action audit (safe fields only)."""
+        limit = max(1, min(int(limit), 500))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT ts, provider, account_id, operation, resource_kind,
+                       resource_id, risk_category, request_id, idempotency_key,
+                       state, verification, result_summary
+                  FROM integration_audit {where}
+                 ORDER BY ts DESC, id DESC LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── v0.30: OAuth authorization flows (durable one-time state) ─────────
+    # Rows are keyed by the state HASH; the raw state value never reaches
+    # this layer. Flow creation/consumption semantics live in
+    # jarvis/integrations/oauth.py::OAuthFlowManager — this layer is the
+    # bounded, transactional persistence only.
+
+    def insert_oauth_flow(
+        self,
+        *,
+        state_hash: str,
+        provider: str,
+        session_id: str,
+        display_label: str,
+        scopes: frozenset[str],
+        redirect_uri: str,
+        code_challenge: str,
+        code_verifier: str,
+        ttl_seconds: int,
+    ) -> dict[str, Any]:
+        """Persist one authorization attempt; returns the stored row."""
+        from datetime import datetime as _dt, timedelta as _td
+
+        created = _utcnow()
+        expires = (
+            _dt.fromisoformat(created) + _td(seconds=max(30, int(ttl_seconds)))
+        ).isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO oauth_states
+                    (state_hash, provider, session_id, display_label,
+                     scopes_json, redirect_uri, code_challenge, code_verifier,
+                     created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    state_hash, provider, session_id, display_label,
+                    _json_dumps(sorted(scopes)), redirect_uri, code_challenge,
+                    code_verifier, created, expires,
+                ),
+            )
+            self._conn.commit()
+        row = self.get_oauth_flow(state_hash)
+        assert row is not None  # we just inserted it
+        return row
+
+    def get_oauth_flow(self, state_hash: str) -> dict[str, Any] | None:
+        """One flow ROW (contains the code verifier — manager-gated only)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM oauth_states WHERE state_hash = ?",
+                (state_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def try_consume_oauth_flow(self, state_hash: str, *, consumed_at: str) -> bool:
+        """
+        ATOMIC one-time consumption: the UPDATE only fires while the row is
+        unconsumed, so exactly one callback can ever win (replay ⇒ False).
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE oauth_states
+                   SET consumed_at = ?
+                 WHERE state_hash = ? AND consumed_at IS NULL
+                """,
+                (consumed_at, state_hash),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def record_oauth_flow_outcome(self, state_hash: str, outcome: str) -> None:
+        """Persist the terminal outcome ('AUTHORIZED' / 'FAILED:<category>')."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE oauth_states SET outcome = ? WHERE state_hash = ?",
+                (outcome[:40], state_hash),
+            )
+            self._conn.commit()
+
+    def latest_oauth_flow(self, provider: str, session_id: str) -> dict[str, Any] | None:
+        """Newest flow row for a session+provider (CLI polling / diagnostics)."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM oauth_states
+                 WHERE provider = ? AND session_id = ?
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """,
+                (provider, session_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def purge_expired_oauth_states(self, *, keep_consumed_seconds: float = 3600.0) -> int:
+        """
+        Bounded cleanup: expired rows go immediately; consumed rows are kept
+        one hour (outcome polling) then purged. Never touches unconsumed,
+        unexpired flows. Bounded per call (≤500 rows).
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        now = _dt.now(tz=_tz.utc)
+        consumed_cutoff = (now - _td(seconds=keep_consumed_seconds)).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM oauth_states
+                 WHERE rowid IN (
+                     SELECT rowid FROM oauth_states
+                      WHERE expires_at < ?
+                         OR (consumed_at IS NOT NULL AND consumed_at < ?)
+                      LIMIT 500
+                 )
+                """,
+                (now.isoformat(), consumed_cutoff),
+            )
+            self._conn.commit()
+        return cursor.rowcount
+
+    def update_integration_account_tokens(
+        self,
+        account_id: str,
+        *,
+        authorization_status: str,
+        token_access_obfuscated: str,
+        token_refresh_obfuscated: str | None,
+        token_expires_at: str,
+        token_updated_at: str,
+        auth_state: str,
+    ) -> None:
+        """
+        ATOMIC token-record update (refresh rotation, re-auth, state change).
+        ``token_refresh_obfuscated=None`` PRESERVES the stored refresh token
+        (RFC 6749: providers may omit it on refresh); an explicit empty
+        string clears it.
+        """
+        with self._lock:
+            if token_refresh_obfuscated is None:
+                self._conn.execute(
+                    """
+                    UPDATE integration_accounts
+                       SET authorization_status = ?, token_access_obfuscated = ?,
+                           token_expires_at = ?, token_updated_at = ?, auth_state = ?
+                     WHERE account_id = ?
+                    """,
+                    (
+                        authorization_status, token_access_obfuscated,
+                        token_expires_at, token_updated_at, auth_state, account_id,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE integration_accounts
+                       SET authorization_status = ?, token_access_obfuscated = ?,
+                           token_refresh_obfuscated = ?, token_expires_at = ?,
+                           token_updated_at = ?, auth_state = ?
+                     WHERE account_id = ?
+                    """,
+                    (
+                        authorization_status, token_access_obfuscated,
+                        token_refresh_obfuscated, token_expires_at,
+                        token_updated_at, auth_state, account_id,
+                    ),
+                )
+            self._conn.commit()
+
+    def cleanup_integration_audit(
+        self,
+        *,
+        retention_days: int,
+        dry_run: bool = False,
+        batch_limit: int = 500,
+    ) -> dict[str, int]:
+        """
+        Conservative retention for integration_audit (v0.30 Part 21).
+
+        Deletes rows older than the cutoff EXCEPT anything needed for active
+        recovery: state UNKNOWN or RUNNING rows are ALWAYS protected (they
+        are the manual-recovery record). Bounded per call. Returns counts —
+        never row contents.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        cutoff = (
+            _dt.now(tz=_tz.utc) - _td(days=max(1, int(retention_days)))
+        ).isoformat()
+        with self._lock:
+            old_protected = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM integration_audit
+                 WHERE ts < ? AND state IN ('UNKNOWN', 'RUNNING')
+                """,
+                (cutoff,),
+            ).fetchone()
+            if dry_run:
+                old_deletable = self._conn.execute(
+                    """
+                    SELECT COUNT(*) AS n FROM integration_audit
+                     WHERE ts < ? AND state NOT IN ('UNKNOWN', 'RUNNING')
+                    """,
+                    (cutoff,),
+                ).fetchone()
+                return {
+                    "deleted": 0,
+                    "would_delete": int(old_deletable["n"]),
+                    "protected": int(old_protected["n"]),
+                }
+            cursor = self._conn.execute(
+                """
+                DELETE FROM integration_audit
+                 WHERE rowid IN (
+                     SELECT rowid FROM integration_audit
+                      WHERE ts < ? AND state NOT IN ('UNKNOWN', 'RUNNING')
+                      LIMIT ?
+                 )
+                """,
+                (cutoff, max(1, int(batch_limit))),
+            )
+            self._conn.commit()
+        return {
+            "deleted": cursor.rowcount,
+            "would_delete": 0,
+            "protected": int(old_protected["n"]),
+        }
+
+    def delete_result_cache_for_account(self, account_id: str) -> int:
+        """
+        v0.30 Part 22: invalidate cached private READS bound to one account.
+        Integration cache rows carry the account id inside their stored
+        arguments (session-scoped by policy), so a disconnect/scope change
+        deletes exactly those entries. Returns the number removed.
+        """
+        needle = f"%{(account_id or '').strip()}%"
+        if needle == "%%":
+            return 0
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM result_cache WHERE args_json LIKE ?", (needle,)
+            )
+            self._conn.commit()
+        return cursor.rowcount
+
     # ── v0.20: personal knowledge base — document registry (read/write) ───
 
     def upsert_knowledge_document(
@@ -1631,6 +2134,105 @@ class SessionStore:
                 """
                 SELECT day, hits, misses, stale, bypass, stores, per_tool_json
                 FROM cache_metrics_daily
+                ORDER BY day DESC LIMIT ?
+                """,
+                (min(days, limit),),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["per_tool"] = _json_loads(entry.pop("per_tool_json") or "{}")
+            except Exception:
+                entry["per_tool"] = {}
+            out.append(entry)
+        return out
+
+    # ── v0.26: grounding-guard telemetry (aggregate counts only) ─────────
+
+    def record_grounding_metrics(
+        self,
+        *,
+        checks: int = 0,
+        contradictions: int = 0,
+        corrections: int = 0,
+        corrections_ok: int = 0,
+        corrections_failed: int = 0,
+        fallbacks: int = 0,
+        per_tool: dict[str, dict[str, int]] | None = None,
+    ) -> None:
+        """
+        Increment TODAY'S aggregate grounding-guard snapshot (v0.26 Part 10).
+        ``per_tool`` maps tool name → {checks, contradictions} deltas.
+        Aggregates only — never answers, evidence text, or arguments.
+        """
+        from datetime import datetime, timezone
+
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        per_tool = per_tool or {}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT per_tool_json FROM grounding_metrics_daily WHERE day = ?",
+                (day,),
+            ).fetchone()
+            merged: dict[str, dict[str, int]] = _json_loads(row[0]) if row else {}
+            for tool, deltas in per_tool.items():
+                bucket = merged.setdefault(str(tool), {})
+                for key, delta in deltas.items():
+                    bucket[str(key)] = bucket.get(str(key), 0) + int(delta)
+            self._conn.execute(
+                """
+                INSERT INTO grounding_metrics_daily
+                    (day, checks, contradictions, corrections, corrections_ok,
+                     corrections_failed, fallbacks, per_tool_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(day) DO UPDATE SET
+                    checks             = checks + excluded.checks,
+                    contradictions     = contradictions + excluded.contradictions,
+                    corrections        = corrections + excluded.corrections,
+                    corrections_ok     = corrections_ok + excluded.corrections_ok,
+                    corrections_failed = corrections_failed + excluded.corrections_failed,
+                    fallbacks          = fallbacks + excluded.fallbacks,
+                    per_tool_json      = excluded.per_tool_json
+                """,
+                (day, checks, contradictions, corrections, corrections_ok,
+                 corrections_failed, fallbacks, _json_dumps(merged)),
+            )
+            self._conn.commit()
+        self._prune_grounding_metrics()
+
+    def _prune_grounding_metrics(self) -> int:
+        """Bounded retention: drop rows older than N days."""
+        from datetime import datetime, timedelta, timezone
+
+        retention_days = int(
+            getattr(_settings_ref(), "GROUNDING_METRICS_RETENTION_DAYS", 30)
+        )
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=retention_days)
+        ).strftime("%Y-%m-%d")
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM grounding_metrics_daily WHERE day < ?", (cutoff,)
+            )
+            self._conn.commit()
+        return cursor.rowcount or 0
+
+    def grounding_metrics_history(
+        self, *, days: int = 30, limit: int = 60
+    ) -> list[dict[str, Any]]:
+        """
+        Bounded history of daily grounding-guard aggregates, newest first.
+        Counts and per-tool deltas only — never answers or evidence text.
+        """
+        days = max(1, min(int(days), 365))
+        limit = max(1, min(int(limit), 365))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT day, checks, contradictions, corrections, corrections_ok,
+                       corrections_failed, fallbacks, per_tool_json
+                FROM grounding_metrics_daily
                 ORDER BY day DESC LIMIT ?
                 """,
                 (min(days, limit),),
@@ -2171,6 +2773,91 @@ def _init_db(conn: sqlite3.Connection) -> None:
             stores       INTEGER NOT NULL DEFAULT 0,
             per_tool_json TEXT NOT NULL DEFAULT '{}'
         );
+
+        -- v0.26: bounded daily snapshots of grounding-guard counters
+        -- (checks/contradictions/corrections/fallbacks, per tool). Aggregates
+        -- only — never answers, evidence text, or arguments. Same retention
+        -- discipline as cache_metrics_daily.
+        CREATE TABLE IF NOT EXISTS grounding_metrics_daily (
+            day          TEXT PRIMARY KEY,
+            checks       INTEGER NOT NULL DEFAULT 0,
+            contradictions INTEGER NOT NULL DEFAULT 0,
+            corrections  INTEGER NOT NULL DEFAULT 0,
+            corrections_ok INTEGER NOT NULL DEFAULT 0,
+            corrections_failed INTEGER NOT NULL DEFAULT 0,
+            fallbacks    INTEGER NOT NULL DEFAULT 0,
+            per_tool_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        -- v0.29: connected integration accounts (Part 3 identity). One row
+        -- per connected account. credential_obfuscated holds the credential
+        -- material (obfuscated — see jarvis/integrations/credentials.py for
+        -- the HONEST local-development boundary). NEVER returned by any
+        -- read method below; only the integration manager decodes it.
+        CREATE TABLE IF NOT EXISTS integration_accounts (
+            account_id         TEXT PRIMARY KEY,
+            provider           TEXT NOT NULL,
+            display_label      TEXT NOT NULL,
+            scopes_json        TEXT NOT NULL,
+            credential_obfuscated TEXT NOT NULL,
+            credential_fingerprint TEXT NOT NULL DEFAULT '',
+            provider_account_ref TEXT NOT NULL DEFAULT '',
+            auth_state         TEXT NOT NULL,
+            granted_at         TEXT NOT NULL,
+            last_verified_at   TEXT,
+            UNIQUE(provider, display_label)
+        );
+        CREATE INDEX IF NOT EXISTS idx_integration_accounts_provider
+            ON integration_accounts (provider);
+
+        -- v0.29 (Part 13): audit trail of EXTERNAL side effects — the
+        -- provider-level supplement to action_executions (which stays the
+        -- authorization/claim ledger). Visible fields only: no arguments,
+        -- no raw payloads, sanitized summaries (bounded).
+        CREATE TABLE IF NOT EXISTS integration_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              TEXT NOT NULL,
+            provider        TEXT NOT NULL,
+            account_id      TEXT NOT NULL,
+            operation       TEXT NOT NULL,
+            resource_kind   TEXT NOT NULL,
+            resource_id     TEXT,
+            risk_category   TEXT NOT NULL,
+            request_id      TEXT NOT NULL,
+            idempotency_key TEXT,
+            state           TEXT NOT NULL,
+            verification    TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
+            result_summary  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_integration_audit_ts
+            ON integration_audit (ts);
+        CREATE INDEX IF NOT EXISTS idx_integration_audit_account
+            ON integration_audit (account_id, ts);
+
+        -- v0.30: durable ONE-TIME OAuth authorization state. Rows are keyed
+        -- by the SHA-256 HASH of the raw state value (the raw value exists
+        -- only inside the authorization URL handed to the operator — never
+        -- persisted, never logged, never shown to the model). Each row binds
+        -- the flow to provider + session + label + scopes + the EXACT
+        -- redirect and is consumed atomically exactly once.
+        CREATE TABLE IF NOT EXISTS oauth_states (
+            state_hash     TEXT PRIMARY KEY,
+            provider       TEXT NOT NULL,
+            session_id     TEXT NOT NULL,
+            display_label  TEXT NOT NULL,
+            scopes_json    TEXT NOT NULL,
+            redirect_uri   TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            code_verifier  TEXT NOT NULL,
+            created_at     TEXT NOT NULL,
+            expires_at     TEXT NOT NULL,
+            consumed_at    TEXT,
+            outcome        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_states_expires
+            ON oauth_states (expires_at);
+        CREATE INDEX IF NOT EXISTS idx_oauth_states_session
+            ON oauth_states (provider, session_id);
     """)
     # Lightweight migrations for pre-v0.15 / pre-v0.17 databases —
     # older installations lack these columns; existing data is preserved.
@@ -2215,6 +2902,24 @@ def _init_db(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE action_executions ADD COLUMN pause_context_json TEXT"
         )
+    # v0.30: OAuth token lifecycle columns on integration_accounts. A NULL
+    # authorization_status marks a legacy v0.29 account (raw credential +
+    # deterministic prefix rules); OAuth accounts carry the full token record
+    # (access/refresh material obfuscated through the SAME credential
+    # boundary — see jarvis/integrations/credentials.py).
+    account_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(integration_accounts)").fetchall()
+    }
+    for column in (
+        "authorization_status",
+        "token_access_obfuscated",
+        "token_refresh_obfuscated",
+        "token_expires_at",
+        "token_updated_at",
+    ):
+        if column not in account_cols:
+            conn.execute(f"ALTER TABLE integration_accounts ADD COLUMN {column} TEXT")
     conn.commit()
 
 

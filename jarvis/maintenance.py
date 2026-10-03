@@ -766,6 +766,20 @@ def cmd_cache(
                 print(f"  {tool:<22} {parts}")
         else:
             print("today: no cache activity recorded")
+        # v0.26 (Part 11): today's grounding-guard aggregates — counts only.
+        g_rows = store.grounding_metrics_history(days=1, limit=1)
+        if g_rows:
+            g = g_rows[0]
+            print(
+                f"grounding today: checks={g['checks']} contradictions={g['contradictions']} "
+                f"corrections={g['corrections']} ok={g['corrections_ok']} "
+                f"failed={g['corrections_failed']} fallbacks={g['fallbacks']}"
+            )
+            for tool, deltas in sorted(g.get("per_tool", {}).items()):
+                parts = ", ".join(f"{k}={v}" for k, v in sorted(deltas.items()))
+                print(f"  {tool:<22} {parts}")
+        else:
+            print("grounding today: no activity recorded")
         return 0
 
     if action == "inspect":
@@ -836,6 +850,56 @@ def cmd_stats(store: SessionStore) -> int:
     print(f"sessions:           {sessions}")
     print(f"messages:           {messages}")
     print(f"pending confirmations: {pending}")
+    return 0
+
+
+def cmd_integration_audit_cleanup(
+    store: SessionStore,
+    *,
+    days: int | None = None,
+    dry_run: bool = False,
+    limit: int = 500,
+    yes: bool = False,
+) -> int:
+    """
+    v0.30 Part 21: conservative retention for integration_audit rows.
+
+    Deletes rows older than the retention window EXCEPT state UNKNOWN /
+    RUNNING rows — the manual-recovery record is protected unconditionally.
+    Deletion is bounded per run; the default is report-only unless ``--yes``.
+    """
+    from jarvis.config import settings as _s
+
+    retention = int(
+        days if days is not None else getattr(_s, "INTEGRATION_AUDIT_RETENTION_DAYS", 90)
+    )
+    if dry_run or not yes:
+        preview = store.cleanup_integration_audit(retention_days=retention, dry_run=True)
+        print(f"integration audit retention: {retention} day(s)")
+        print(
+            f"  would delete: {preview['would_delete']}   "
+            f"protected (UNKNOWN/RUNNING): {preview['protected']}"
+        )
+        print(
+            "  dry run — nothing deleted." if dry_run
+            else "  re-run with --yes to delete (bounded per run)."
+        )
+        return 0
+    result = store.cleanup_integration_audit(
+        retention_days=retention, dry_run=False, batch_limit=limit
+    )
+    print(
+        f"integration audit retention: {retention} day(s); "
+        f"deleted {result['deleted']} row(s); protected {result['protected']}"
+    )
+    if result["deleted"] >= max(1, int(limit)):
+        print("  note: batch limit reached — run again to continue (bounded deletion).")
+    log.info(
+        "integration_audit_cleanup",
+        deleted=result["deleted"],
+        protected=result["protected"],
+        retention_days=retention,
+    )
     return 0
 
 
@@ -956,6 +1020,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_knowledge.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_integration_audit = sub.add_parser(
+        "integrations-audit",
+        help=(
+            "v0.30 conservative retention for integration_audit rows "
+            "(UNKNOWN/RUNNING always protected)"
+        ),
+    )
+    p_integration_audit.add_argument(
+        "--days", type=int, default=None,
+        help="Retention window in days (default: INTEGRATION_AUDIT_RETENTION_DAYS)",
+    )
+    p_integration_audit.add_argument(
+        "--dry-run", action="store_true", help="Report only (default without --yes)"
+    )
+    p_integration_audit.add_argument(
+        "--limit", type=int, default=500, help="Max rows deleted per run (default 500)"
+    )
+    p_integration_audit.add_argument(
+        "--yes", action="store_true", help="Perform the bounded deletion"
+    )
+
     p_cache = sub.add_parser(
         "cache",
         help="v0.24 cross-turn result cache: stats / inspect / cleanup (bounded)",
@@ -1017,6 +1102,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.action,
                 limit=args.limit,
                 expire_older_than_days=args.expire_older_than_days,
+                yes=args.yes,
+            )
+        if args.command == "integrations-audit":
+            return cmd_integration_audit_cleanup(
+                store,
+                days=args.days,
+                dry_run=args.dry_run,
+                limit=args.limit,
                 yes=args.yes,
             )
         if args.command == "stats":

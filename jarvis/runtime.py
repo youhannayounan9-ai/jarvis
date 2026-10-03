@@ -23,6 +23,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from jarvis import __version__
+from jarvis.browser.emergency import get_emergency_stop
+from jarvis.browser.registry import close_browser_registry
 from jarvis.config import settings
 from jarvis.core.orchestrator import Orchestrator
 from jarvis.core.permissions import PermissionGuard
@@ -53,7 +55,9 @@ log = get_logger(__name__)
 # computer_control is NEVER registered (fail-closed placeholder only).
 # execute_python_code joins the surface ONLY when explicitly enabled in
 # config AND verified Docker isolation is actually available (checked via
-# _build_code_execution_tool). See docs/architecture.md § Safety Model.
+# _build_code_execution_tool). The v0.28 browser tool family joins ONLY
+# when ENABLE_BROWSER_CONTROL=true (default False) — see below.
+# See docs/architecture.md § Safety Model and docs/JARVIS_V028_SECURITY_MODEL.md.
 _TOOL_FACTORIES: tuple = (
     GetCurrentDatetimeTool,
     WebSearchTool,
@@ -116,6 +120,11 @@ class JarvisRuntime:
     _session_locks_guard: threading.Lock = field(default_factory=threading.Lock)
     # v0.17: durable identity of THIS runtime instance for session leases.
     owner_token: str = field(default_factory=lambda: new_owner_token("runtime"))
+    # v0.29: the IntegrationManager when integrations are enabled (None when
+    # the surface is off). Interfaces use it for management surfaces (CLI/API
+    # /dashboard) — the MODEL only ever reaches integrations through the
+    # registered tools + permission machinery.
+    integration_manager: object | None = None
 
     @contextmanager
     def _exclusive_session(self, session_id: str) -> Iterator[None]:
@@ -235,7 +244,18 @@ class JarvisRuntime:
         return row is not None
 
     def close(self) -> None:
-        """Release resources (DB connection)."""
+        """Release resources (DB connection, browser sessions, stop state)."""
+        # v0.28: close every open browser controller (bounded resources,
+        # no orphaned Chromium processes) and clear the emergency stop so a
+        # restarted runtime starts clean. Best-effort by contract.
+        try:
+            close_browser_registry()
+        except Exception as e:  # pragma: no cover - close is best-effort
+            log.warning("browser_registry_close_failed", error=str(e))
+        try:
+            get_emergency_stop().reset()
+        except Exception:  # pragma: no cover - best-effort
+            pass
         self.store.close()
 
     def __enter__(self) -> "JarvisRuntime":
@@ -286,6 +306,44 @@ def build_runtime() -> JarvisRuntime:
     if code_tool is not None:
         registry.register(code_tool)
 
+    # v0.28: safe browser control — OPT-IN. The nine narrow browser tools
+    # (open_url, get_page_state, extract_visible_text, take_screenshot,
+    # click_element, fill_input, select_option, go_back, wait_for_element)
+    # appear in the LLM's tool surface only when the operator enables it.
+    # They are NOT added to `disabled_tools` (that list describes surfaces
+    # that are permanently absent or code-execution-gated); when disabled
+    # here they are simply never visible to the model. Every action still
+    # flows through PermissionGuard (dynamic risk → confirmation parking)
+    # — enabling the surface adds capability, never a permission bypass.
+    if getattr(settings, "ENABLE_BROWSER_CONTROL", False):
+        from jarvis.tools.browser_control import build_browser_tools
+
+        for browser_tool in build_browser_tools():
+            registry.register(browser_tool)
+        log.info("browser_control_enabled", driver=settings.BROWSER_DRIVER)
+
+    # v0.29: personal integrations — OPT-IN (same pattern as browser
+    # control). When ENABLE_INTEGRATIONS=true the IntegrationManager is
+    # assembled here (the single owner of connected accounts + providers)
+    # and the eight narrow integration tools join the surface. Every write
+    # flows through the EXISTING dynamic-risk → confirmation parking →
+    # action-ledger machinery; enabling adds capability, never a bypass.
+    _integration_manager = None
+    if getattr(settings, "ENABLE_INTEGRATIONS", False):
+        from jarvis.integrations.manager import IntegrationManager
+        from jarvis.integrations.providers import (
+            LocalCalendarProvider,
+            LocalTasksProvider,
+        )
+        from jarvis.tools.integration_tools import build_integration_tools
+
+        _integration_manager = IntegrationManager(store)
+        _integration_manager.register_provider(LocalCalendarProvider())
+        _integration_manager.register_provider(LocalTasksProvider())
+        for integration_tool in build_integration_tools(_integration_manager):
+            registry.register(integration_tool)
+        log.info("integrations_enabled", providers=["calendar", "tasks"])
+
     guard = PermissionGuard()
     orchestrator = Orchestrator(store=store, tool_registry=registry, permission_guard=guard)
 
@@ -295,4 +353,10 @@ def build_runtime() -> JarvisRuntime:
         model=settings.ollama_model,
         version=__version__,
     )
-    return JarvisRuntime(store=store, registry=registry, guard=guard, orchestrator=orchestrator)
+    return JarvisRuntime(
+        store=store,
+        registry=registry,
+        guard=guard,
+        orchestrator=orchestrator,
+        integration_manager=_integration_manager,
+    )

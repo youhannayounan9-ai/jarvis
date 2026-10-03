@@ -30,6 +30,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid as _uuid
 from collections.abc import Iterator
 from typing import Any
 
@@ -116,6 +117,72 @@ class JarvisClient:
             raise JarvisClientError(0, f"connection failed: {e.reason}") from e
 
     # ── Endpoints ─────────────────────────────────────────────────────────────
+
+    def chat_multimodal(
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        image_bytes: bytes | None = None,
+        image_mime: str | None = None,
+        audio_bytes: bytes | None = None,
+        audio_mime: str | None = None,
+        refresh: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """
+        v0.27 multimodal turn (multipart/form-data). The server validates
+        and normalizes; the SAME runtime (tools, permissions, grounding)
+        executes. Returns {session_id, response, modality, ...}.
+        """
+        boundary = f"----jarvis{_uuid.uuid4().hex[:16]}"
+        parts: list[bytes] = []
+
+        def _field(name: str, value: str) -> bytes:
+            return (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                f"{value}\r\n"
+            ).encode("utf-8")
+
+        def _file(name: str, filename: str, mime: str, data: bytes) -> bytes:
+            return (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
+                f"filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
+            ).encode("utf-8") + data + b"\r\n"
+
+        parts.append(_field("text", message))
+        if session_id:
+            parts.append(_field("session_id", session_id))
+        if refresh:
+            parts.append(_field("refresh", "true"))
+        if image_bytes is not None:
+            parts.append(_file("image", "upload.png", image_mime or "image/png", image_bytes))
+        if audio_bytes is not None:
+            parts.append(_file("audio", "upload.wav", audio_mime or "audio/wav", audio_bytes))
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(parts)
+
+        url = f"{self.base_url}/chat/multimodal"
+        headers = self._headers()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace")
+            try:
+                detail = json.loads(raw).get("detail", raw)
+            except (json.JSONDecodeError, AttributeError):
+                detail = raw
+            if e.code == 409:
+                raise SessionConflict(409, str(detail)) from e
+            if e.code == 429:
+                retry_after = int(e.headers.get("Retry-After", "1") or 1)
+                raise RateLimitedError(str(detail), retry_after) from e
+            raise JarvisClientError(e.code, str(detail)) from e
+        except urllib.error.URLError as e:
+            raise JarvisClientError(0, f"connection failed: {e.reason}") from e
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health", timeout=DEFAULT_TIMEOUT_CONNECT)
@@ -334,6 +401,104 @@ class JarvisClient:
     def remove_knowledge_document(self, document_id: str) -> dict[str, Any]:
         return self._request(
             "DELETE", f"/knowledge/documents/{document_id}"
+        )
+
+    # ── v0.28 safe browser control ─────────────────────────────────────────
+
+    def browser_status(self) -> dict[str, Any]:
+        """Safe browser posture snapshot (no page content, no URLs)."""
+        return self._request(
+            "GET", "/browser/status", timeout=DEFAULT_TIMEOUT_CONNECT
+        )
+
+    def emergency_stop(self, reason: str = "user requested emergency stop") -> dict[str, Any]:
+        """Trigger the HUMAN-ONLY browser emergency stop."""
+        return self._request("POST", "/browser/emergency-stop", {"reason": reason})
+
+    def emergency_reset(self) -> dict[str, Any]:
+        """Operator reset of the emergency stop (idempotent)."""
+        return self._request(
+            "POST", "/browser/emergency-reset", {},
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    # ── v0.29 integration management (metadata only; never credentials) ────
+
+    def list_integrations(self) -> list[dict[str, Any]]:
+        """Provider catalog + connected accounts (safe metadata)."""
+        return self._request(
+            "GET", "/integrations", timeout=DEFAULT_TIMEOUT_CONNECT
+        )
+
+    def integration_scopes(self, provider: str) -> dict[str, Any]:
+        """Exact scope menu for one provider."""
+        return self._request(
+            "GET", f"/integrations/{provider}/scopes",
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def integration_connect(
+        self,
+        provider: str,
+        display_label: str,
+        scopes: list[str],
+        credential: str | None = None,
+        provider_account_ref: str = "",
+    ) -> dict[str, Any]:
+        """Explicitly connect one account (user-controlled)."""
+        body: dict[str, Any] = {
+            "display_label": display_label,
+            "scopes": scopes,
+        }
+        if credential:
+            body["credential"] = credential
+        if provider_account_ref:
+            body["provider_account_ref"] = provider_account_ref
+        return self._request(
+            "POST", f"/integrations/{provider}/connect", body,
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def integration_disconnect(self, account_id: str) -> dict[str, Any]:
+        """Disconnect one account (removes stored credentials locally)."""
+        return self._request(
+            "POST", f"/integrations/accounts/{account_id}/disconnect", {},
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def integration_audit(self, account_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Recent external side effects for one account (safe fields)."""
+        return self._request(
+            "GET", f"/integrations/accounts/{account_id}/audit",
+            params={"limit": limit},
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    # ── v0.30 OAuth (real authorization; never returns token material) ─────
+
+    def integration_authorize(
+        self, provider: str, session_id: str, display_label: str, scopes: list[str]
+    ) -> dict[str, Any]:
+        """Start an OAuth authorization; returns the URL the OPERATOR opens."""
+        return self._request(
+            "POST", f"/integrations/{provider}/authorize",
+            {"session_id": session_id, "display_label": display_label, "scopes": scopes},
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def integration_authorize_status(self, provider: str, session_id: str) -> dict[str, Any]:
+        """Bounded polling view for a started authorization (no state values)."""
+        return self._request(
+            "GET", f"/integrations/{provider}/authorize/status",
+            params={"session_id": session_id},
+            timeout=DEFAULT_TIMEOUT_CONNECT,
+        )
+
+    def integration_refresh(self, account_id: str) -> dict[str, Any]:
+        """Re-verify one account (opportunistic token refresh included)."""
+        return self._request(
+            "POST", f"/integrations/accounts/{account_id}/refresh", {},
+            timeout=DEFAULT_TIMEOUT_CONNECT,
         )
 
 

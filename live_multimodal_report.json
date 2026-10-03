@@ -1,0 +1,62 @@
+{
+  "summary": {
+    "cases": 7,
+    "infrastructure_ok": "0/0",
+    "provider_model_ok": "5/5",
+    "reasoning_ok": "2/2",
+    "latency_mean_s": 23.8,
+    "latency_median_s": 18.99,
+    "note": "Small sample. Infrastructure = plumbing/validation; provider/model = Whisper/llava/Edge/qwen behavior (varies); reasoning = answer quality (never universal). TTS is NETWORK-BACKED (Edge); STT is LOCAL (Whisper); vision is LOCAL (llava via Ollama)."
+  },
+  "cases": [
+    {
+      "case": "1_text_request",
+      "band": "provider/model",
+      "ok": true,
+      "detail": "A palindrome is a sequence of characters that reads the same forwards and backwards, such as \"madam\" or \"racecar\".",
+      "duration_s": 18.99
+    },
+    {
+      "case": "2_image_understanding",
+      "band": "provider/model",
+      "ok": true,
+      "detail": "The image shows a graphical user interface with a red and white color scheme. It features a window displaying an \"ERROR Disk Full\" message at the bottom, and a checkmark icon at the bottom right, sugg",
+      "duration_s": 40.94
+    },
+    {
+      "case": "3_image_plus_text",
+      "band": "provider/model",
+      "ok": true,
+      "detail": "The error text in the screenshot says \"Error disk full\".",
+      "duration_s": 57.91
+    },
+    {
+      "case": "4_image_then_tool",
+      "band": "provider/model",
+      "ok": true,
+      "detail": "The product of 893 multiplied by 47 is 41,971.",
+      "duration_s": 32.26
+    },
+    {
+      "case": "5_audio_file_stt_pipeline",
+      "band": "provider/model",
+      "ok": true,
+      "detail": "transcribed: '' (tone → likely empty)",
+      "duration_s": 1.84
+    },
+    {
+      "case": "8_session_followup",
+      "band": "reasoning",
+      "ok": true,
+      "detail": "follow-up answer: The dominant color in the image is grey.",
+      "duration_s": 9.89
+    },
+    {
+      "case": "9_grounding_multimodal",
+      "band": "reasoning",
+      "ok": true,
+      "detail": "The product of 7284 multiplied by 931 is 6,781,404.",
+      "duration_s": 4.76
+    }
+  ]
+}

@@ -3,6 +3,9 @@
 *.env
 !.env.example
 
+# Integration credential key file (v0.29) — per-install secret
+.jarvis_integration_key
+
 # ── Local databases & vector memory — NEVER commit ─────────────────────────
 *.db
 *.sqlite

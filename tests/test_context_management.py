@@ -94,8 +94,10 @@ def test_active_tool_truncation():
 
     assert len(evidence_blob) < len(huge_payload)
     # The evidence ITEM is clamp-bounded; the blob also carries the base
-    # system prompt, so allow that overhead.
-    assert len(evidence_blob) <= settings.max_tool_output_chars + 3500
+    # system prompt, so allow that overhead (v0.28 grew the prompt with the
+    # browser-guidance block, v0.29 with the integrations paragraph — the
+    # CLAMP on the tool payload is unchanged).
+    assert len(evidence_blob) <= settings.max_tool_output_chars + 5000
     assert "characters omitted" in evidence_blob
     # Head is preserved (payload was uniform 'A's, so start must be present)
     assert "AAA" in evidence_blob

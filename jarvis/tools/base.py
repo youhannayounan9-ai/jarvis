@@ -95,6 +95,13 @@ class BaseTool(ABC):
     # see jarvis/core/result_cache.py for the enforcement boundary.
     cache_policy: "CachePolicy | None" = None
 
+    # v0.28: DYNAMIC per-call risk. Static ``risk_level`` stays the ceiling;
+    # when a tool declares args-dependent risk (browser actions worded
+    # submit/delete → HIGH), the registry consults ``risk_for_args`` with the
+    # VALIDATED arguments before PermissionGuard runs. Default: static level.
+    def risk_for_args(self, args: dict[str, Any]) -> str:
+        return self.risk_level
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Validate risk_level / timeout_seconds when a concrete tool is defined."""
         super().__init_subclass__(**kwargs)
@@ -199,11 +206,19 @@ def _build_pydantic_model(tool_name: str, schema: dict[str, Any]) -> Type[BaseMo
                 py_type = Literal[tuple(enum_values)]  # type: ignore
 
         description = field_info.get("description", "")
-        
+
+        # v0.28: enforce declared string bounds (maxLength only — no other
+        # tool declares bounds, and capping strings is strictly defensive:
+        # bounded results are the grounding/redaction contract upstream).
+        extra_kwargs: dict[str, Any] = {}
+        max_length = field_info.get("maxLength")
+        if py_type is str and isinstance(max_length, int) and max_length > 0:
+            extra_kwargs["max_length"] = max_length
+
         if field_name in required_fields:
-            fields[field_name] = (py_type, Field(..., description=description))
+            fields[field_name] = (py_type, Field(..., description=description, **extra_kwargs))
         else:
-            fields[field_name] = (py_type, Field(default=None, description=description))
+            fields[field_name] = (py_type, Field(default=None, description=description, **extra_kwargs))
             
     from pydantic import ConfigDict
     config = ConfigDict(extra="forbid")

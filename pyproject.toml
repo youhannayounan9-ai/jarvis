@@ -1,6 +1,6 @@
 [project]
 name = "jarvis"
-version = "0.25.0"
+version = "0.30.0"
 description = "A local, modular AI assistant powered by Ollama — JARVIS v0.20 (personal knowledge + RAG: document ingestion, grounded retrieval with citations, injection-resistant evidence framing)"
 readme = "README.md"
 requires-python = ">=3.11"

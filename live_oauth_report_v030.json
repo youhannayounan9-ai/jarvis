@@ -1,0 +1,160 @@
+{
+  "failed": 0,
+  "generated_at": "2026-10-02T14:25:59.326642+00:00",
+  "mode": "deterministic \u2014 simulated local provider, no Ollama, no network; the model-driven chat path is measured separately by live_provider_eval.py",
+  "passed": 18,
+  "performance_ms": {
+    "authorization_callback_ms": 12.0671,
+    "authorization_start_ms": 0.2669,
+    "cache_hit_ms": 0.1921,
+    "disconnect_ms": 0.6557,
+    "provider_read_ms": 0.5798,
+    "provider_write_and_verify_ms": 7.734,
+    "readback_verification_ms": 0.99,
+    "token_refresh_ms": 1.6878
+  },
+  "phases": {
+    "grounding": [
+      "G_grounding_consistent",
+      "G_grounding_contradiction"
+    ],
+    "integration_runtime": [
+      "8_calendar_write",
+      "8b_calendar_read",
+      "11_readback_verification",
+      "9_task_read_write",
+      "10_confirmation_required",
+      "13_post_disconnect_rejected",
+      "P_cache_hit"
+    ],
+    "oauth_flow": [
+      "1_start_authorization",
+      "2_user_grants_scope",
+      "3_callback_succeeds",
+      "4_account_identity_discovered",
+      "5_credential_stored",
+      "7_access_token_refresh",
+      "12_disconnect",
+      "14_reauthorization_restores_access"
+    ],
+    "provider_api": [
+      "6_provider_read_succeeds"
+    ]
+  },
+  "provider": {
+    "calendar": "local simulated OAuth provider (development only)",
+    "production_like": false,
+    "tasks": "local simulated OAuth provider (development only)"
+  },
+  "steps": [
+    {
+      "detail": "url_len=386",
+      "name": "1_start_authorization",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "code_len=46",
+      "name": "2_user_grants_scope",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "account=calendar:73d6eb763546 status=AUTHORIZED",
+      "name": "3_callback_succeeds",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "ref=eval-user@example.com",
+      "name": "4_account_identity_discovered",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "obfuscated at rest; no plaintext material",
+      "name": "5_credential_stored",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "count=0",
+      "name": "6_provider_read_succeeds",
+      "ok": true,
+      "phase": "provider_api"
+    },
+    {
+      "detail": "rotated access+refresh tokens; account identity preserved",
+      "name": "7_access_token_refresh",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "created + verified",
+      "name": "8_calendar_write",
+      "ok": true,
+      "phase": "integration_runtime"
+    },
+    {
+      "detail": "listing reflects the write",
+      "name": "8b_calendar_read",
+      "ok": true,
+      "phase": "integration_runtime"
+    },
+    {
+      "detail": "got matches what was sent",
+      "name": "11_readback_verification",
+      "ok": true,
+      "phase": "integration_runtime"
+    },
+    {
+      "detail": "time=15:30",
+      "name": "G_grounding_consistent",
+      "ok": true,
+      "phase": "grounding"
+    },
+    {
+      "detail": "shifted=17:30 rejected",
+      "name": "G_grounding_contradiction",
+      "ok": true,
+      "phase": "grounding"
+    },
+    {
+      "detail": "create + complete + read",
+      "name": "9_task_read_write",
+      "ok": true,
+      "phase": "integration_runtime"
+    },
+    {
+      "detail": "risk=SYSTEM; parked before any side effect",
+      "name": "10_confirmation_required",
+      "ok": true,
+      "phase": "integration_runtime"
+    },
+    {
+      "detail": "provider grant revoked; local row removed",
+      "name": "12_disconnect",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "ERROR: INTEGRATION_REFUSED: no connected account with that i",
+      "name": "13_post_disconnect_rejected",
+      "ok": true,
+      "phase": "integration_runtime"
+    },
+    {
+      "detail": "account=calendar:fae154bc58f0",
+      "name": "14_reauthorization_restores_access",
+      "ok": true,
+      "phase": "oauth_flow"
+    },
+    {
+      "detail": "hit",
+      "name": "P_cache_hit",
+      "ok": true,
+      "phase": "integration_runtime"
+    }
+  ],
+  "version": "0.30.0"
+}

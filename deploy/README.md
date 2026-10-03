@@ -95,6 +95,66 @@ daemon, and the image locally. Every run is still one-shot, network-less,
 read-only-rootfs, capability-less, non-root, and resource-capped — and still
 `SYSTEM` risk, so a durable confirmation is required before execution.
 
+### Enabling personal integrations (v0.29)
+
+```env
+ENABLE_INTEGRATIONS=true
+```
+
+This gates the 8 integration tools (calendar list/get/create/update/delete,
+task list/create/complete), the `/integrations*` API endpoints, the CLI
+`/integration*` commands, and the dashboard Integrations section. Providers
+ship local-dev only (`LocalCalendarProvider` / `LocalTasksProvider`; the API
+surfaces `production_like=false`) — v0.30 adds a real OAuth FLOW but still
+ships no real third-party provider adapter, so do not expose integrations on
+a public deployment. The credential key file `.jarvis_integration_key` is
+created next to `DB_PATH` — treat it as a secret and never commit it. There
+is deliberately NO HTTP execute endpoint: the chat runtime is the only
+execution path.
+
+### OAuth setup & redirect requirements (v0.30)
+
+v0.30 adds a provider-neutral OAuth authorization-code + PKCE flow. No new
+dependency is required (the token client uses the stdlib `urllib`). Configure
+it through the same env surface:
+
+```env
+OAUTH_REDIRECT_BASE_URL=http://127.0.0.1:8000   # MUST match the provider's registered callback exactly
+OAUTH_STATE_TTL_SECONDS=600                     # one-time authorization state lifetime
+OAUTH_REFRESH_MARGIN_SECONDS=300                # refresh access tokens this long before expiry
+OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600             # local-dev token lifetime
+OAUTH_CODE_TTL_SECONDS=120                       # local-dev authorization-code lifetime
+OAUTH_CALENDAR_CLIENT_ID=local-dev-calendar
+OAUTH_CALENDAR_CLIENT_SECRET=local-dev-calendar-secret
+OAUTH_TASKS_CLIENT_ID=local-dev-tasks
+OAUTH_TASKS_CLIENT_SECRET=local-dev-tasks-secret
+INTEGRATION_AUDIT_RETENTION_DAYS=90             # bound the audit trail
+```
+
+The callback the provider must redirect to is
+**`{OAUTH_REDIRECT_BASE_URL}/integrations/oauth/callback/{provider}`** (the
+session id is appended as a query parameter by the authorization URL).
+Deployment notes and honest limits:
+
+- The callback endpoint is **deliberately not API-key-gated** — it is visited
+  by the user's browser after the provider redirect; the one-time `state` IS
+  the authenticator (standard OAuth). It returns a fixed local HTML page, never
+  a redirect and never a token. Do not put it behind an auth proxy that would
+  break the browser redirect.
+- The redirect base must be reachable by the user's browser. For a Docker
+  deployment, `127.0.0.1:8000` works only when the API port is published to the
+  host (`-p 8000:8000`); otherwise set it to the externally reachable URL.
+- Client id/secret above are **local-dev placeholders** for the simulated
+  provider. Real providers require their own id/secret and a fixed registered
+  redirect URI.
+- Tokens are stored with the same local **obfuscation** as v0.29 credentials —
+  a privacy guard, **not** encryption. Do not treat a deployment's token store
+  as production-grade secret management; a real OS keychain / encrypted store
+  is the documented next step behind the same `CredentialStore` interface.
+- Prune the audit trail with `maintenance integrations-audit` (report-only by
+default; `--yes` performs a bounded deletion). Rows whose state is
+  UNKNOWN or RUNNING are **always** protected from cleanup.
+
 ### Timeout enforcement (three distinct layers)
 
 Since v0.15 the time limit is enforced **at the workload boundary** (v0.16
@@ -142,6 +202,9 @@ uv run streamlit run ui/dashboard.py
 - `DB_PATH` on a persistent volume; backups of `jarvis.db`
 - `ENABLE_CODE_EXECUTION` left off unless the host is Linux/WSL2 with the
   dedicated image pre-pulled
+- `ENABLE_INTEGRATIONS` left off unless personal integrations are wanted
+  (local-dev providers only; keep `.jarvis_integration_key` out of backups
+  that leave the host)
 - computer control remains unconditionally disabled — there is no flag
 
 ---
@@ -306,6 +369,26 @@ security control, not an optimization:
   - the API exposes counts only: `GET /ops/cache/stats` (auth'd) — no
     fingerprints, no payloads. The dashboard Operations → Result cache
     section renders the same safe metadata.
+  - **v0.27 (multimodal):** `POST /chat/multimodal` accepts multipart
+    text + optional image (JPEG/PNG/WebP/GIF ≤10 MB) + optional audio
+    (WAV/MP3 ≤25 MB), content-sniffed (magic bytes) and pixel-bounded;
+    uploads are stored under random names in `multimodal_upload_dir`
+    (default `./jarvis_data/uploads`, inside the file sandbox) and deleted
+    after the request — session history keeps only the derived text.
+    STT is LOCAL Whisper (needs ffmpeg on PATH for audio upload handling);
+    TTS is NETWORK-BACKED Edge TTS (`TTS_ENABLED=false` or CLI `--no-tts`
+    to disable); vision is LOCAL llava (`vision_model`). Same auth, rate
+    limits and session leases as `/chat` — no separate security model.
+  - **v0.26 (grounding guard):** every grounded synthesis turn records
+    daily counters (checks / contradictions / corrections / fallbacks,
+    per tool) into `grounding_metrics_daily` (same SQLite, same
+    retention discipline). Surfaced via `GET /ops/grounding/stats`
+    (aggregates only — never answers or evidence text),
+    `maintenance cache stats` (`grounding today:`), and the dashboard's
+    Answer-grounding (last 14 days) table. Kill switch:
+    `JARVIS_DISABLE_GROUNDING_GUARD=true` restores v0.25 synthesis
+    behavior (no check, no correction); `GROUNDING_METRICS_RETENTION_DAYS`
+    (default 30) bounds the table.
   - **v0.25:** every dispatch also records daily hit/miss/stale/bypass/
     store counters into `cache_metrics_daily` (same SQLite, per-tool
     deltas merged atomically), pruned past

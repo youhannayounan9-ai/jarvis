@@ -56,6 +56,23 @@ CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
     "vision": ("vision_analyze",),
     "web": ("web_search", "web_scrape", "wikipedia_summary"),
     "compute": ("calculator", "get_current_datetime"),
+    # v0.28: the safe browser family. Members are present in the registry
+    # ONLY when ENABLE_BROWSER_CONTROL=true, so these entries stay inert
+    # (no narrowing, no routing effect) when the surface is off.
+    "browser": (
+        "open_url", "get_page_state", "extract_visible_text",
+        "take_screenshot", "click_element", "fill_input", "select_option",
+        "go_back", "wait_for_element",
+    ),
+    # v0.29: the personal-integrations family. Members are present in the
+    # registry ONLY when ENABLE_INTEGRATIONS=true, so these entries stay
+    # inert when the surface is off (same pattern as the browser family).
+    "integrations": (
+        "calendar_list_events", "calendar_get_event",
+        "calendar_create_event", "calendar_update_event",
+        "calendar_delete_event", "task_list", "task_create",
+        "task_complete",
+    ),
 }
 
 # Tools that are obligation-triggers: if the request clearly needs this
@@ -80,6 +97,16 @@ _CAPABILITY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "vision": ("this image", "the screenshot", "analyze the image", "describe the image", "photo"),
     "web": ("search the web", "search for", "latest", "current", "news", "price of", "wikipedia", "who is", "what is the weather"),
     "compute": ("calculate", "compute", "how many", "sum of", "what day", "what date", "what time", "days until", "days between", "days from"),
+    # v0.28: capability-class nouns only (general, not phrase-farmed).
+    # Deliberately EXCLUDES bare 'click'/'fill' — too collision-prone in
+    # non-browser sentences; narrowing (below) carries those.
+    "browser": ("browser", "web page", "webpage", "navigate to", "the form"),
+    # v0.29: integration nouns (capability-class; connected-service ask).
+    "integrations": (
+        "calendar", "my calendar", "my events", "connected calendar",
+        "my tasks", "task list", "connected tasks", "upcoming events",
+        "schedule", "my agenda", "my todo", "to-do",
+    ),
 }
 
 # Word-boundary regexes for NARROWING planned-step descriptions. These are
@@ -93,6 +120,17 @@ _NARROW_PATTERNS: dict[str, re.Pattern[str]] = {
     "vision": re.compile(r"\b(images?|screenshots?|photos?|pictures?)\b", re.IGNORECASE),
     "web": re.compile(r"\b(web|search|wikipedia|urls?|news|latest|current)\b", re.IGNORECASE),
     "compute": re.compile(r"\b(calculate|calculation|compute|arithmetic|math|date|time|days?|weeks?|months?)\b", re.IGNORECASE),
+    # v0.28: browser-family narrowing (conservative nouns; capability-class,
+    # not phrase-farming). Only fires for tools that ARE registered.
+    "browser": re.compile(
+        r"\b(browser|webpage|web page|click|fill|form|dropdown|navigate)\b",
+        re.IGNORECASE,
+    ),
+    # v0.29: integrations-family narrowing (calendar/task nouns).
+    "integrations": re.compile(
+        r"\b(calendar|calendars?|events?|agenda|schedule|tasks?|todos?|to-dos?)\b",
+        re.IGNORECASE,
+    ),
 }
 
 # Explicit arithmetic always implies the compute capability, even when no
@@ -121,6 +159,15 @@ _UNAVAILABLE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\b(restart|shut ?down|lock)\b.*\b(computer|pc|machine|system)\b", re.IGNORECASE),
         "computer control",
     ),
+)
+
+# v0.29 (Part 11): email-send requests get the honest refusal (no email
+# tool exists; the safety model is documented, not faked).
+_EMAIL_SEND_PATTERN = re.compile(
+    r"\b(send|email|e-mail|mail)\b[^.?!\n]{0,60}\b(email|e-mail|mail|message|letter)\b|"
+    r"\bsend\b[^.?!\n]{0,60}\b(to\s+\S+@|an email|the email)\b|"
+    r"\b(email|e-mail|mail)\b[^?!\n]{0,80}\b[\w.+-]+@[\w-]+\.\w+",
+    re.IGNORECASE,
 )
 # Word-boundary-safe regex cache (built once from _CAPABILITY_KEYWORDS).
 _CAPABILITY_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -423,4 +470,18 @@ def detect_unmet_capability(user_input: str, registry: ToolRegistry) -> str | No
                 "name the missing capability, and offer the nearest safe "
                 "alternative. Never simulate or claim its result."
             )
+    # v0.29 (Part 11): email/messaging is DESIGNED but deliberately not
+    # implemented. Sending must be honestly refused even when integrations
+    # are enabled — drafting the content is fine; sending never happens
+    # without a real, audited email provider (none exists in v0.29).
+    if _EMAIL_SEND_PATTERN.search(user_input or "") and not any(
+        "email" in t for t in registered
+    ):
+        return (
+            "CAPABILITY NOTE: the user's request needs email SENDING, which "
+            "is NOT in the tool list and is deliberately not implemented "
+            "(high-risk external side effect). Refuse honestly: you may "
+            "draft the message text for the user to send themselves, but "
+            "never claim an email was sent and never pretend to send one."
+        )
     return None

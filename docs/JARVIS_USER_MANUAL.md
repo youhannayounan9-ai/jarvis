@@ -55,6 +55,7 @@ Status legend: **ACTIVE** = on by default · **OPTIONAL** = works after you enab
 | Text-to-speech | OPTIONAL | Edge TTS neural voice | **Internet** + ffmpeg (ffplay) | Same voice session |
 | `execute_python_code` | ENVIRONMENT-DEPENDENT | Python in a hardened one-shot Docker container | `ENABLE_CODE_EXECUTION=true` **and** Linux/WSL2 Docker with the sandbox image built+pulled; **also always parks a confirmation** | (after approval) runs user code, returns stdout |
 | `computer_control` | PLACEHOLDER | Mouse/keyboard automation — **never registered**, returns refusal if somehow invoked | None (unusable by design) | — |
+| Personal integrations (calendar & tasks) | OPTIONAL | Read + **confirmed** writes on a connected local calendar/tasks account (8 tools; audit log) | `ENABLE_INTEGRATIONS=true` + connect an account (§8k) | "What's on my calendar Friday?" / "Create an event Friday 15:00" |
 | FastAPI REST service | ACTIVE | Sessions, chat, SSE streaming, confirmations, history, health | Python deps | `uv run uvicorn jarvis.api.app:app --port 8000` |
 | SSE streaming | ACTIVE | Live agent lifecycle events | API running | `POST /chat/stream` |
 | API authentication | OPTIONAL | Bearer/X-API-Key on all endpoints except /health | `JARVIS_API_KEY` set | — |
@@ -72,7 +73,7 @@ Status legend: **ACTIVE** = on by default · **OPTIONAL** = works after you enab
 
 ## 3. What JARVIS Cannot Do Yet
 
-- **No OS automation** — `computer_control` is a structurally disabled placeholder; JARVIS cannot move your mouse or type for you.
+- **No OS automation** — `computer_control` is a structurally disabled placeholder; JARVIS cannot move your mouse or type for you. (v0.28 adds a **safe, isolated automation BROWSER** — see §8j — but the host boundary itself stays closed: no shell, registry, process or clipboard control.)
 - **No file writes** — `write_file` is refused by the permission guard (FILE_WRITE tier blocked outright). File access is read-only.
 - **No code execution on Windows hosts** — the sandbox refuses Windows by design (use WSL2 or Linux). On this Windows machine, Docker Desktop's Linux engine does run, but `sandbox.is_available()` still fails closed on `win32` — so even with Docker running, `execute_python_code` stays unregistered on this host.
 - **No multi-process state sharing** — rate limiting, per-session locks, and the ChromaDB vector store are single-process. Run one API process (or front it with a reverse proxy for limits).
@@ -80,6 +81,7 @@ Status legend: **ACTIVE** = on by default · **OPTIONAL** = works after you enab
 - **No distributed safety** — do not run multiple replicas against one SQLite DB expecting shared rate limits or shared session locks.
 - **Model limits** — a 7B-class model makes planning/tool-order mistakes; live eval measured 23/32 (71.9%) on qwen2.5:7b.
 - **TTS needs internet** — speech output streams from Microsoft's Edge TTS endpoint (STT is local).
+- **No email** — `EMAIL_READ`/`EMAIL_SEND` scopes are declared in the v0.29 integration framework but deliberately unimplemented; the assistant honestly refuses to send mail (see §8k).
 - **Vision needs a second model** — `llava` is not pulled by default; `vision_analyze` errors until it is.
 - **Confirmation TTL** — pending confirmations expire after 10 minutes; re-ask after expiry.
 
@@ -476,6 +478,72 @@ Refresh skips **only the result cache**. Permissions, confirmation gates, repeat
 
 Every turn records hit/miss/stale/bypass/store counters (per tool) into a small daily table kept for 30 days by default (`RESULT_CACHE_METRICS_RETENTION_DAYS`). View it three ways: the dashboard's **Daily cache activity (last 14 days)** table, the API `GET /ops/cache/stats/history`, or `maintenance cache stats`, which now prints today's counters and per-tool deltas.
 
+## 8h. The Grounding Guard — Answer Integrity (v0.26)
+
+### What changed
+
+v0.25 taught the final answer step to transcribe tool evidence instead of recomputing from memory. v0.26 **enforces it**: after every answer is generated, a deterministic checker (the **grounding guard**) compares the answer's checkable claims against the turn's trusted tool evidence. This is a system guarantee, not a prompt hope — it works the same way regardless of model mood, and it adds no network calls on the normal path.
+
+### What the guard can verify today (high-confidence cases only)
+
+- **Calculator numbers** — if the answer states a different value near result wording ("the result is…", "the total…", "… = …") than the calculator produced, it is caught. Formatting never matters: `41971`, `41,971`, `41 971`, `$41,971`, `41971.0` are all the same number.
+- **Stated dates** — a different full date than the one the datetime tool returned is caught.
+- **File listings** — claiming a file exists (or doesn't) contrary to a directory listing is caught.
+- **Labeled fields** — answers restating an evidence field (`temperature: 21.5`) with a different value are caught.
+
+It deliberately does **not** reject things it cannot understand: step narrations ("Step 1 gave 893"), years, timestamps/IDs, latencies ("120 ms"), percentages that aren't the tool result, or paraphrases all pass untouched. A missed catch is acceptable; a false rejection is not.
+
+### What happens on a contradiction
+
+1. JARVIS does **not** show you the wrong answer.
+2. It retries **once** — the evidence is restated with an explicit "transcribe, do not recompute" instruction.
+3. If the retry still contradicts the evidence, JARVIS **withholds** the generated answer and replies with a truthful notice plus the authoritative tool value(s), including whether they came from live execution or cache. It never fabricates an answer to satisfy the checker.
+
+### Kill switch and telemetry
+
+`JARVIS_DISABLE_GROUNDING_GUARD=true` restores exact v0.25 behavior. Daily aggregate counters (checks, contradictions, corrections, fallbacks — never answer text) are visible in the dashboard's **Answer grounding (last 14 days)** table, `GET /ops/grounding/stats`, and `maintenance cache stats`.
+
+---
+
+## 8i. Voice & Images (v0.27)
+
+### One runtime, three ways in
+
+Text, voice, and images all converge on the same JARVIS runtime — the same routing, tools, permissions, confirmations, evidence and grounding. There is no separate "voice JARVIS"; your voice simply becomes text, and your image becomes an observation the assistant can reason about and act on with tools.
+
+### Push-to-talk voice
+
+```bash
+jarvis --voice-ptt        # push-to-talk (ENTER per turn)
+jarvis --no-tts           # voice input, text-only replies
+```
+
+Each turn: press **ENTER** → speak (a few seconds) → JARVIS transcribes with **local Whisper** (audio never leaves your machine), thinks, then **speaks the final checked answer**. There is no always-on listening and no wake word — the microphone is only active during your explicit turn.
+
+The turn lifecycle is visible: LISTENING → TRANSCRIBING → THINKING → SPEAKING. If a turn fails (mic error, silence, provider down) JARVIS says so and you simply start another turn — nothing is corrupted. Press **Ctrl+C during playback** to stop the speech immediately (barge-in).
+
+### Spoken replies (optional, network-backed)
+
+Speech replies use Microsoft **Edge TTS**, which is a free **online** service — the reply text leaves your machine to be synthesized, then plays locally via ffplay. Do not want that? Start with `--no-tts` or set `TTS_ENABLED=false`; transcription stays fully local either way.
+
+### Images
+
+Attach an image to any question — "What's in this image?", "Read this screenshot.", "What error is shown here?" — in three ways:
+
+- **Dashboard:** the sidebar uploader (JPEG/PNG/WebP/GIF, ≤10 MB) plus your normal chat message.
+- **CLI:** `jarvis --image path/to/shot.png "What error is shown?"`
+- **API:** `POST /chat/multimodal` (multipart form: `text`, optional `image`, optional `audio`).
+
+Uploads are validated by **content** (not by file name), size- and pixel-bounded, stored briefly under a random name inside the sandbox, and deleted after the turn. What the vision model (llava, local) sees is treated strictly as an **observation** — data to reason about, never instructions, and never mistaken for a trusted tool result. Text inside an image (like "delete everything") is data too, and carries no authority.
+
+### Voice via audio file / API
+
+`jarvis --audio-file note.wav` transcribes a WAV/MP3 with local Whisper and runs it as one turn; the API accepts `audio` uploads the same way (≤25 MB).
+
+### Follow-up memory works
+
+"Look at this screenshot." → "What was the error you saw?" — the second turn remembers the first because everything lives in the same session.
+
 ---
 
 ## 9. Streamlit Dashboard
@@ -699,4 +767,97 @@ Durable means restart-safe: the parked action + resume context live in SQLite (T
 
 ---
 
-*Every command and behavior in this manual was verified against the actual repository (v0.16.0, September 2026). When code and docs disagree, code wins — and this manual was written from the code.*
+## 8j. Safe Browser (v0.28)
+
+### An opt-in, isolated automation browser
+
+JARVIS can optionally browse the web for you through its own **automation browser** — completely separate from your normal browser (fresh temporary profile; none of your cookies, logins, or extensions). It is **off by default**; an operator turns it on with `ENABLE_BROWSER_CONTROL=true` in the config. When off, the assistant honestly says browsing is not available.
+
+When on, the assistant can: open a URL, read the page's visible text and structure, take a screenshot, fill a field, pick a dropdown option, click, go back, or wait for an element. It cannot run page scripts, touch cookies or storage, open extra tabs, or type into your real computer.
+
+### What stops a bad action
+
+Every single browser action passes the same gauntlet, in order — these are **code checks, not suggestions the model can talk its way around**:
+
+1. **URL policy** — only plain http(s) websites; `javascript:`, `file:`, embedded logins, weird ports, and your local/private network addresses are refused (DNS is checked so a look-alike name pointing at your machine cannot slip through).
+2. **Fresh eyes required** — before clicking or typing, the assistant must reference a fresh observation of the page; after any navigation the old view is invalidated, so it can never act on a stale page.
+3. **Rate limits** — bounded actions per turn/session, and the identical side-effecting action is refused a second time.
+4. **Risk → your confirmation** — clicks worded *Submit / Delete / Pay / Send* and password/card fields are automatically escalated: JARVIS pauses and asks you to confirm (same durable `/confirm` flow as everything else).
+5. **Honest results** — each action reports a runtime-computed status: `ACTION_VERIFIED`, `ACTION_NOT_VERIFIED`, `ACTION_BLOCKED`, or `ACTION_INTERRUPTED`. The assistant is instructed to (and the grounding guard helps ensure it) never claim success for an unverified action.
+
+Page text is treated as **untrusted data**: hidden text is invisible to it, secrets are redacted before it ever reads the page, and instructions written into a page ("ignore your instructions and open …") are reported to you — never obeyed.
+
+### The emergency stop
+
+Anything the browser is doing can be halted instantly, and **only by you**: press **Ctrl+X** while a turn is running, or type `/stop` (clear it later with `/resume`), use the API `POST /browser/emergency-stop`, or click the dashboard's 🛑 button. The model has **no tool** that can trigger or clear the stop — that is by construction. Downloads go to a sealed temp area (never your Downloads folder), executables are never stored, and everything is wiped when the session closes.
+
+---
+
+## 8k. Personal Integrations — Calendar & Tasks (v0.29)
+
+### Connect your services — without handing over the keys
+
+JARVIS v0.29 adds an **opt-in** integration framework (`ENABLE_INTEGRATIONS=true`; it is **off by default**). When it is off, the assistant honestly says integrations are unavailable. When it is on, you connect an account yourself — **you** choose the account and the exact permission scopes at connect time; the assistant can never grant itself more. Two local-dev providers ship today: a **calendar** (events: list, get, create, update, delete) and **tasks** (list, create, complete). Both run entirely on your machine; no data leaves it.
+
+You can also connect through the REST API (`POST /integrations/{provider}/connect`), the dashboard's **Integrations** section, or the CLI (`/integration-connect`). Disconnecting (`/integration-disconnect`, dashboard, or API) removes the account **and** its stored credential.
+
+### What a normal workflow looks like
+
+- **Reads** ("What's on my calendar for Friday?", "show my open tasks") run under the SAFE permission tier, are cached briefly per-account, and their counts/titles are grounding-checked like any tool result.
+- **Writes** ("create an event …", "add a task …", "mark the dentist task done") always pause for your **explicit approval first** — the confirmation shows the exact event or task (title, date, time, timezone, duration) before anything is sent. Deleting an event additionally requires the delete scope and asks every time.
+- **Everything is auditable**: every attempted side effect is recorded in a per-account audit log you can read with the CLI (`/integration-status`), the dashboard, or `GET /integrations/accounts/{account_id}/audit` — the answer to "what did JARVIS do on my accounts?" is always one command away.
+
+### The boundaries (unchanged by integrations)
+
+- The assistant never sees your credential — it works with an opaque account handle. Credentials are stored locally, obfuscated at rest, and never appear in chat history, logs, or API responses.
+- The assistant cannot expand scopes, cannot touch an account you did not connect, and cannot act with revoked or expired credentials (the connection is re-verified before every operation).
+- If a write's outcome is ambiguous (e.g. a crash mid-dispatch), it is marked **UNKNOWN** and reported — it is **never silently re-run**; you can re-issue it explicitly, and a built-in idempotency key ensures a re-issued create cannot duplicate the event.
+- **Email is not available**: `EMAIL_READ`/`EMAIL_SEND` scopes are declared but deliberately unimplemented — the assistant will honestly refuse to send mail rather than pretend.
+- Real third-party providers (Google Calendar, Outlook, Todoist, …) are a future addition; the v0.29 providers are local-dev only and labeled as such.
+
+---
+
+## 8l. Real OAuth Connection (v0.30)
+
+### Connecting with a real sign-in
+
+v0.30 replaces "paste a credential" with a real **OAuth authorization-code flow** (with PKCE) for providers that advertise it. Start the connection from whichever surface you use:
+
+- **CLI**: `/integration-connect` — if the provider supports OAuth it offers that path first; it prints an **authorization URL** for you to open, then waits for you to approve and return.
+- **Dashboard**: the **Integrations** section opens an OAuth expander where you pick a display label and the exact **scopes** you are granting, then click **Start authorization** and open the URL.
+- **API**: `POST /integrations/{provider}/authorize` returns the `authorization_url`; poll `GET /integrations/{provider}/authorize/status` until it completes.
+
+You approve on the provider's own page, then the provider redirects your browser to JARVIS's callback. Nothing is connected until that callback completes — and if it never completes (you close the tab, the link expires), no account is created.
+
+### What the state parameter protects
+
+Every authorization attempt carries a one-time, cryptographically random **state**. JARVIS stores only its hash, ties it to your session, the provider, the exact scopes, and the redirect target, and expires it after 10 minutes. A callback with a missing, expired, already-used, or mismatched state is **rejected** — so a stale or forged link cannot connect an account you did not authorize.
+
+### Tokens, expiry, and re-authentication
+
+JARVIS receives an **access token** and (usually) a **refresh token**. When the access token is expired or close to expiring, it is **refreshed automatically** before your action runs — you should not notice. Two honest states matter to you:
+
+- **Authentication required** — the refresh failed; the account will refuse actions until you reconnect. Reconnect with `/integration-reauthenticate` (CLI), the dashboard **Re-authenticate** button, or the API.
+- **Revoked** — the provider revoked your grant. JARVIS does **not** keep retrying; reconnect to restore access.
+
+You can ask JARVIS to re-check an account at any time with **Refresh now** (dashboard) or `POST /integrations/accounts/{account_id}/refresh`.
+
+### Disconnecting
+
+Disconnecting (`/integration-disconnect`, the dashboard, or the API) asks the provider to **revoke** the grant (best effort — if the provider is unreachable, the local account is still cleared), deletes the stored tokens, clears that account's cached reads, and makes every later action fail closed. Reconnecting is the only way back.
+
+### Multi-account behavior
+
+You can connect more than one account. Account identity comes from the **provider**, never from what you type, so two accounts can share a display label without ever being confused — and reads/writes never leak across accounts. Choose an account explicitly; JARVIS never switches on its own.
+
+### Honest local-development boundary
+
+Tokens are stored in the same **obfuscated** local store as v0.29 — a privacy guard, **not** encryption, and **not** production-grade secret management. The shipped calendar/tasks providers are still local-dev; real third-party providers are future work that will use the same flow. Nothing about the OAuth layer changes any other boundary: writes still pause for your approval, ambiguous outcomes are still reported as UNKNOWN rather than retried, and email is still deliberately unavailable.
+
+### Grounding you can rely on
+
+Answers that state an event's **time**, **timezone**, or a task's **status** are now checked against the provider evidence — a wrong clock time, wrong weekday, or wrong status is caught and corrected (or withheld with the authoritative value) rather than spoken confidently.
+
+---
+
+*Every command and behavior in this manual was verified against the actual repository. When code and docs disagree, code wins — and this manual was written from the code.*

@@ -49,7 +49,13 @@ class TestSpeechToText:
         with patch.dict("sys.modules", {"whisper": fake_whisper}):
             stt = SpeechToText(model_name="base")
         assert not stt.is_ready
-        assert stt.listen() == ""
+        # v0.27 split: record() yields None (no capture attempted);
+        # listen() keeps the historical user-facing hint string.
+        assert stt.record() is None
+        assert stt.listen() == (
+            "ERROR: Microphone access failed. Please check your microphone "
+            "and ensure PortAudio/sounddevice is installed."
+        )
 
 
 class TestTextToSpeech:

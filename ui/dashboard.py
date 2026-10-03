@@ -54,6 +54,24 @@ class ApiBackend:
         result = self._client.chat(message, session_id, refresh=refresh)
         return result.get("response", "")
 
+    def chat_multimodal(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        image_bytes: bytes | None = None,
+        audio_bytes: bytes | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """v0.27 multimodal turn over the API (same auth/rate limits)."""
+        return self._client.chat_multimodal(
+            message,
+            session_id,
+            image_bytes=image_bytes,
+            audio_bytes=audio_bytes,
+            refresh=refresh,
+        )
+
     def history(self, session_id: str) -> list[dict[str, Any]]:
         return self._client.history(session_id)
 
@@ -119,6 +137,28 @@ class ApiBackend:
     def cache_entries(self, limit: int = 25):
         raise JarvisClientError(501, "Cache payload inspection is not exposed over the API.")
 
+    # ── v0.26 grounding guard ──────────────────────────────────────────────
+
+    def grounding_history(self, days: int = 14, limit: int = 30) -> list[dict[str, Any]]:
+        """Daily grounding-guard aggregates (v0.26) — counts only."""
+        return self._client._request(
+            "GET",
+            "/ops/grounding/stats",
+            params={"days": days, "limit": limit},
+        )
+
+    # ── v0.28 safe browser control ─────────────────────────────────────────
+
+    def browser_status(self) -> dict[str, Any]:
+        """Safe browser posture snapshot (bounded metadata only)."""
+        return self._client.browser_status()
+
+    def emergency_stop(self, reason: str = "dashboard operator stop") -> dict[str, Any]:
+        return self._client.emergency_stop(reason)
+
+    def emergency_reset(self) -> dict[str, Any]:
+        return self._client.emergency_reset()
+
 
 class LegacyBackend:
     """In-process runtime (single-machine fallback; pre-v0.11 behavior)."""
@@ -135,6 +175,55 @@ class LegacyBackend:
 
     def chat(self, session_id: str, message: str, refresh: bool = False) -> str:
         return self._runtime.chat(session_id, message, refresh=refresh)
+
+    def chat_multimodal(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        image_bytes: bytes | None = None,
+        audio_bytes: bytes | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """v0.27 multimodal turn in-process (legacy fallback backend)."""
+        import io as _io
+
+        from jarvis.multimodal.models import Attachment, MultimodalRequest
+        from jarvis.multimodal.service import MultimodalService
+        from jarvis.voice.stt import SpeechToText
+
+        text = message
+        image = None
+        modality = "text"
+        if audio_bytes is not None:
+            from jarvis.multimodal.models import validate_audio_bytes
+
+            mime = validate_audio_bytes(audio_bytes)
+            transcribed = SpeechToText().transcribe_bytes(audio_bytes, mime)
+            if transcribed.startswith("ERROR:") or not transcribed:
+                raise ValueError(transcribed or "No speech detected in the audio.")
+            text = f"{message} {transcribed}".strip()
+            modality = "audio"
+        if image_bytes is not None:
+            image = Attachment.from_upload(image_bytes)
+            modality = "image+text" if modality == "audio" or text.strip() else "image"
+        request = MultimodalRequest(
+            text=text,
+            session_id=session_id,
+            modality=modality,
+            image=image,
+            refresh=refresh,
+        )
+        try:
+            response = MultimodalService(self._runtime.orchestrator).run(request)
+        finally:
+            if image is not None:
+                image.cleanup()
+        return {
+            "session_id": session_id,
+            "response": response,
+            "modality": request.modality,
+        }
 
     def history(self, session_id: str) -> list[dict[str, Any]]:
         return self._runtime.store.load_history(session_id)
@@ -289,6 +378,83 @@ class LegacyBackend:
             )
         return rows
 
+    # ── v0.26 grounding guard ──────────────────────────────────────────────
+
+    def grounding_history(self, days: int = 14, limit: int = 30) -> list[dict[str, Any]]:
+        """Daily grounding-guard aggregates (v0.26) — counts only."""
+        return self._runtime.store.grounding_metrics_history(days=days, limit=limit)
+
+    # ── v0.28 safe browser control ─────────────────────────────────────────
+
+    def browser_status(self) -> dict[str, Any]:
+        from jarvis.browser.emergency import get_emergency_stop
+        from jarvis.browser.registry import get_browser_registry
+
+        stop = get_emergency_stop()
+        registry = get_browser_registry()
+        downloads = sum(
+            int(c.status().get("downloads", 0)) for c in registry.controllers()
+        )
+        return {
+            "enabled": bool(
+                getattr(settings, "ENABLE_BROWSER_CONTROL", False)
+            ),
+            "driver": str(settings.BROWSER_DRIVER),
+            "emergency_stop_active": bool(stop.status()["active"]),
+            "emergency_stop_reason": str(stop.status()["reason"]),
+            "emergency_stop_token": int(stop.status()["token"]),
+            "open_sessions": registry.open_count(),
+            "max_sessions": int(settings.BROWSER_MAX_SESSIONS),
+            "downloads_captured": downloads,
+        }
+
+    def emergency_stop(self, reason: str = "dashboard operator stop") -> dict[str, Any]:
+        from jarvis.browser.emergency import get_emergency_stop
+        from jarvis.browser.registry import get_browser_registry
+
+        token = get_emergency_stop().trigger(reason=reason)
+        get_browser_registry().close_all()
+        return {"triggered": True, "token": token, "reason": reason}
+
+    def emergency_reset(self) -> dict[str, Any]:
+        from jarvis.browser.emergency import get_emergency_stop
+
+        was_active = get_emergency_stop().reset()
+        return {"was_active": was_active}
+
+    # ── v0.29 integration management (legacy in-process backend) ───────────
+
+    def list_integrations(self) -> list[dict[str, Any]]:
+        """Provider catalog + accounts (public metadata; never credentials)."""
+        manager = getattr(self._runtime, "integration_manager", None)
+        if manager is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for name, provider in manager.providers().items():
+            cap = provider.capabilities
+            out.append({
+                "provider": name,
+                "display_name": cap.display_name,
+                "production_like": cap.production_like,
+                "grantable_scopes": sorted(cap.grantable_scopes),
+                "resource_kind": cap.resource.kind,
+                "operations": sorted(op.value for op in cap.resource.operations),
+                "supports_idempotency_key": cap.supports_idempotency_key,
+                "accounts": [a.public_metadata() for a in manager.list_accounts(name)],
+            })
+        return out
+
+    def integration_disconnect(self, account_id: str) -> dict[str, Any]:
+        manager = getattr(self._runtime, "integration_manager", None)
+        if manager is None:
+            return {"disconnected": False, "account_id": account_id, "message": "Integrations disabled."}
+        removed = manager.disconnect(account_id)
+        return {
+            "disconnected": removed,
+            "account_id": account_id,
+            "message": "Account disconnected; stored credentials removed locally.",
+        }
+
 
 @st.cache_resource
 def get_backend() -> Any:
@@ -354,7 +520,7 @@ def _render_ops(backend: Any, current_session: str) -> None:
 
     section = st.radio(
         "Section",
-        ["Recent actions", "UNKNOWN actions", "Session leases", "Session timeline", "Plan status", "Result cache"],
+        ["Recent actions", "UNKNOWN actions", "Session leases", "Session timeline", "Plan status", "Result cache", "Browser control", "Integrations"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -675,6 +841,44 @@ def _render_ops(backend: Any, current_session: str) -> None:
                 "30 days). Inspect/cleanup via CLI: "
                 "`maintenance cache stats|inspect|cleanup`."
             )
+
+        # ── v0.26 (Part 11): grounding-guard daily aggregates ─────────────
+        grounding_rows, gerr = _safe(
+            lambda: backend.grounding_history(days=14, limit=30),
+            "loading grounding metrics history",
+        )
+        if gerr is None and grounding_rows is not None:
+            st.markdown("**Answer grounding (last 14 days)**")
+            if grounding_rows:
+                st.dataframe(
+                    [
+                        {
+                            "day": row["day"],
+                            "checks": row["checks"],
+                            "contradictions": row["contradictions"],
+                            "corrections": row["corrections"],
+                            "corrections ok": row["corrections_ok"],
+                            "corrections failed": row["corrections_failed"],
+                            "fallbacks": row["fallbacks"],
+                            "top tools": ", ".join(
+                                sorted(row.get("per_tool", {}).keys())
+                            ) or "—",
+                        }
+                        for row in reversed(grounding_rows)
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("No grounding activity recorded yet.")
+            st.caption(
+                "Every final answer is deterministically checked against the "
+                "turn's trusted tool evidence. A high-confidence contradiction "
+                "triggers exactly ONE transcription-only correction round; if "
+                "that still contradicts, the generated answer is withheld and "
+                "the authoritative value is reported instead. Counts only — "
+                "never answers or evidence text."
+            )
             if backend.mode == "legacy":
                 entries, err2 = _safe(
                     lambda: backend.cache_entries(25), "loading cache entries"
@@ -694,6 +898,188 @@ def _render_ops(backend: Any, current_session: str) -> None:
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    # ── Browser control (v0.28): posture + human-only emergency stop ──────
+    elif section == "Browser control":
+        """Safe-browser surface state and the emergency stop. Status is
+        bounded safe metadata (enabled/driver/stop state/session counts) —
+        never page content, URLs, or arguments. The stop button and reset
+        are HUMAN-ONLY controls: the model has no tool that can trigger or
+        clear them."""
+        status, err = _safe(backend.browser_status, "loading browser status")
+        if err is None and status is not None:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Surface", "enabled" if status["enabled"] else "disabled")
+            c2.metric("Driver", status["driver"])
+            c3.metric(
+                "Emergency stop",
+                "ACTIVE" if status["emergency_stop_active"] else "clear",
+            )
+            c4, c5, c6 = st.columns(3)
+            c4.metric("Open sessions", status["open_sessions"], f"max {status['max_sessions']}")
+            c5.metric("Downloads captured", status["downloads_captured"])
+            c6.metric("Stop token", status["emergency_stop_token"])
+            if status["emergency_stop_active"]:
+                st.warning(f"Emergency stop active: {status['emergency_stop_reason']}")
+            st.caption(
+                "The browser surface is opt-in (ENABLE_BROWSER_CONTROL). Every "
+                "action passes URL policy, observation freshness, pacing limits, "
+                "dynamic risk → confirmation, and deterministic verification; "
+                "page text is untrusted data. HIGH-risk actions (submit/delete/"
+                "password-worded) always require your explicit confirmation."
+            )
+            b1, b2 = st.columns(2)
+            if b1.button("🛑 Emergency stop", type="primary", help="Interrupt any in-flight browser action now. Human-only."):
+                _safe(
+                    lambda: backend.emergency_stop("dashboard operator stop"),
+                    "triggering emergency stop",
+                )
+                st.rerun()
+            if b2.button("Reset stop", disabled=not status["emergency_stop_active"], help="Clear the emergency stop (operator action)."):
+                _safe(backend.emergency_reset, "resetting emergency stop")
+                st.rerun()
+
+    # ── Integrations (v0.29): connected accounts + external actions ───────
+    elif section == "Integrations":
+        """Connected personal services. Shows account identity, scopes,
+        auth state and recent EXTERNAL actions. Never displays credentials
+        or tokens (they are structurally absent from the API projection).
+        Connect/disconnect are the only mutations here; external resource
+        actions always flow through the chat runtime with confirmation."""
+        providers, err = _safe(backend.list_integrations, "loading integrations")
+        if err is None and providers is not None:
+            if not providers:
+                st.info("No integration providers registered (ENABLE_INTEGRATIONS=false or none built).")
+            for p in providers:
+                st.subheader(f"🔗 {p['display_name']}")
+                st.caption(
+                    ("Production-like" if p.get("production_like") else "Development-only provider")
+                    + f" · resource: {p.get('resource_kind', '?')} · operations: "
+                    + ", ".join(p.get("operations", []))
+                )
+                st.markdown("Scopes: `" + "` `".join(p.get("grantable_scopes", [])) + "`")
+                _render_oauth_connect(backend, p)
+                accounts = p.get("accounts", [])
+                if not accounts:
+                    st.info("No accounts connected for this provider.")
+                for a in accounts:
+                    state = a.get("auth_state", "ERROR")
+                    icon = {"AUTHENTICATED": "✅", "EXPIRED": "⚠️", "REVOKED": "⛔", "DISCONNECTED": "➖"}.get(state, "❓")
+                    oauth_status = a.get("authorization_status") or "—"
+                    oauth_icon = {
+                        "AUTHORIZED": "🔐", "TOKEN_EXPIRING": "🕒", "REFRESHING": "♻️",
+                        "AUTHENTICATION_REQUIRED": "🔑", "REVOKED": "⛔", "ERROR": "❓",
+                        "AUTHORIZING": "⏳", "DISCONNECTED": "➖",
+                    }.get(oauth_status, "•")
+                    col_a, col_b, col_c = st.columns([3, 2, 1])
+                    col_a.markdown(
+                        f"{icon} **{a.get('display_label', '?')}** · `{a.get('account_id', '?')}`"
+                    )
+                    col_b.markdown(
+                        f"{state} · {oauth_icon} {oauth_status} · "
+                        f"verified: {(a.get('last_verified_at') or 'never')[:19]}"
+                    )
+                    if col_c.button("Disconnect", key=f"dc-{a.get('account_id')}", help="Revoke at the provider (when supported) and remove stored local credentials."):
+                        _safe(
+                            lambda aid=a.get("account_id"): backend.integration_disconnect(aid),
+                            "disconnecting account",
+                        )
+                        st.rerun()
+                    st.markdown("Granted: `" + "` `".join(a.get("scopes", [])) + "`")
+                    if a.get("authorization_expires_at"):
+                        st.caption(f"Authorization expires: {a.get('authorization_expires_at')}")
+                    b_re, b_rf, _sp = st.columns([1, 1, 3])
+                    if b_re.button("↻ Re-authenticate", key=f"re-{a.get('account_id')}", help="Start a fresh OAuth authorization for this label (rotates tokens)."):
+                        start, err = _safe(
+                            lambda: backend.integration_authorize(
+                                a.get("provider", ""),
+                                _dashboard_oauth_session(),
+                                a.get("display_label", ""),
+                                a.get("scopes", []),
+                            ),
+                            "starting re-authorization",
+                        )
+                        if err is None and start:
+                            st.markdown(f"[Open the authorization page]({start.get('authorization_url', '')})")
+                    if b_rf.button("⟳ Refresh now", key=f"rf-{a.get('account_id')}", help="Re-verify this account now (opportunistic token refresh)."):
+                        _safe(
+                            lambda aid=a.get("account_id"): backend.integration_refresh(aid),
+                            "refreshing account",
+                        )
+                        st.rerun()
+            st.divider()
+            st.caption(
+                "External writes (create/update/delete/complete) are NOT "
+                "performed here: the agent performs them only through the "
+                "chat runtime with your explicit confirmation, the action "
+                "ledger, and read-back verification. Credentials are never "
+                "displayed in this dashboard."
+            )
+
+
+def _dashboard_oauth_session() -> str:
+    """Stable per-browser dashboard session id for OAuth state binding."""
+    key = "jarvis_oauth_session"
+    if key not in st.session_state:
+        import uuid as _uuid
+
+        st.session_state[key] = f"dashboard-{_uuid.uuid4().hex[:8]}"
+    return str(st.session_state[key])
+
+
+def _render_oauth_connect(backend: Any, provider_info: dict) -> None:
+    """
+    v0.30: start a user-controlled OAuth authorization from the dashboard.
+
+    The authorization URL is displayed for the OPERATOR to open; the callback
+    lands on the API server's fixed endpoint. The dashboard never displays
+    tokens, authorization codes, or state values beyond that URL.
+    """
+    provider = str(provider_info.get("provider") or "")
+    if not provider:
+        return
+    if not provider_info.get("supports_oauth", False):
+        return
+    with st.expander("🔐 Connect with OAuth (recommended)"):
+        label = st.text_input(
+            "Account label", key=f"oauth-label-{provider}", max_chars=64
+        )
+        scopes = st.multiselect(
+            "Scopes to grant (exact — never expandable by the model)",
+            provider_info.get("grantable_scopes", []),
+            key=f"oauth-scopes-{provider}",
+        )
+        if st.button("Start authorization", key=f"oauth-start-{provider}"):
+            if not label.strip() or not scopes:
+                st.warning("A label and at least one scope are required.")
+            else:
+                start, err = _safe(
+                    lambda: backend.integration_authorize(
+                        provider, _dashboard_oauth_session(), label.strip(), scopes
+                    ),
+                    "starting authorization",
+                )
+                if err is None and start:
+                    st.session_state[f"oauth-url-{provider}"] = start.get("authorization_url", "")
+        url = st.session_state.get(f"oauth-url-{provider}")
+        if url:
+            st.markdown(f"**[Open the authorization page]({url})** and approve.")
+            st.caption(
+                "The provider redirects to JARVIS's fixed callback endpoint. "
+                "Local simulated providers may require an out-of-band consent step."
+            )
+            if st.button("Check authorization status", key=f"oauth-check-{provider}"):
+                status, err = _safe(
+                    lambda: backend.integration_authorize_status(
+                        provider, _dashboard_oauth_session()
+                    ),
+                    "checking authorization status",
+                )
+                if err is None and status:
+                    outcome = str(status.get("status", ""))
+                    st.info(f"Authorization status: {outcome}")
+                    if outcome == "AUTHORIZED":
+                        st.rerun()
 
 
 def _render_knowledge(backend: Any) -> None:
@@ -846,22 +1232,34 @@ st.sidebar.caption(f"Messages: {msg_count}")
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
+# ── v0.27 multimodal inputs ──────────────────────────────────────────────
+# The image NO LONGER touches disk under the client's name: bytes are sent
+# to the API, which content-sniffs, bounds, and stores them under a random
+# name inside the sandbox (client filenames/paths are never trusted).
 uploaded_file = st.sidebar.file_uploader(
-    "Upload an image for JARVIS to see",
-    type=["jpg", "png", "jpeg"],
+    "Attach an image (JPEG/PNG/WebP/GIF, ≤10 MB)",
+    type=["jpg", "jpeg", "png", "webp", "gif"],
     key=f"uploader_{st.session_state.uploader_key}",
 )
-
-saved_file_path = None
+image_bytes = None
 if uploaded_file is not None:
-    from pathlib import Path
+    image_bytes = uploaded_file.getvalue()
+    st.sidebar.caption(
+        f"Image attached: {len(image_bytes) / 1024:.0f} KB — validated by "
+        "the server (content-sniffed; stored under a random name)."
+    )
 
-    uploads_dir = Path("jarvis_data/uploads")
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    saved_file_path = (uploads_dir / uploaded_file.name).resolve()
-    with open(saved_file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.sidebar.success("Image uploaded successfully.")
+uploaded_audio = st.sidebar.file_uploader(
+    "Or attach audio (WAV/MP3, ≤25 MB) — transcribed with local Whisper",
+    type=["wav", "mp3"],
+    key=f"audio_{st.session_state.uploader_key}",
+)
+audio_bytes = None
+if uploaded_audio is not None:
+    audio_bytes = uploaded_audio.getvalue()
+    st.sidebar.caption(f"Audio attached: {len(audio_bytes) / 1024:.0f} KB.")
+
+saved_file_path = None  # v0.27: images no longer pre-written to disk client-side
 
 st.title("JARVIS Assistant")
 
@@ -903,19 +1301,48 @@ if user_input := st.chat_input("How can I help you?"):
 
     with st.chat_message("user"):
         st.markdown(user_input)
+        if image_bytes is not None:
+            st.caption("🖼️ image attached")
+        if audio_bytes is not None:
+            st.caption("🎙️ audio attached")
 
     with st.chat_message("assistant"):
-        with st.spinner("JARVIS is planning and executing..."):
-            try:
+        # v0.27: visible processing state (Part 14).
+        status = st.status("JARVIS is working…", expanded=True)
+        status.update(label="Routing request…", state="running")
+        try:
+            if image_bytes is not None or audio_bytes is not None:
+                status.update(label="Sending multimodal request…")
+                result = backend.chat_multimodal(
+                    st.session_state.session_id,
+                    user_input,
+                    image_bytes=image_bytes,
+                    audio_bytes=audio_bytes,
+                    refresh=bool(st.session_state.get("refresh_mode")),
+                )
+                response = result.get("response", "")
+                status.update(
+                    label=f"Done ({result.get('modality', 'multimodal')} turn)",
+                    state="complete",
+                )
+            else:
                 response = backend.chat(
                     st.session_state.session_id,
                     user_input,
                     refresh=bool(st.session_state.get("refresh_mode")),
                 )
-                st.markdown(response)
-            except Exception as e:
-                st.error(f"Error: {e}")
-                response = None
+                status.update(label="Done", state="complete")
+            st.markdown(response)
+        except Exception as e:
+            status.update(label="Failed", state="error")
+            st.error(f"Error: {e}")
+            response = None
+        finally:
+            # One-shot attachments: the bytes are consumed by this turn and
+            # are NOT persisted beyond it (privacy/retention, Part 16).
+            image_bytes = None
+            audio_bytes = None
+            st.session_state.uploader_key += 1
 
 try:
     pending = backend.pending_confirmation(st.session_state.session_id)

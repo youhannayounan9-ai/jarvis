@@ -1,0 +1,116 @@
+{
+  "summary": {
+    "reps": 2,
+    "tool_choice_success": 1.0,
+    "grounding_final_value_ok": 1.0,
+    "cache_hit_turn2": 2,
+    "refresh_redispatch": 2,
+    "fallback_used": 0,
+    "conversational_clean": 2,
+    "latency_mean_s": 4.15,
+    "latency_median_s": 4.22,
+    "note": "Small sample; mechanism metrics (cache/refresh/guard) are system-side and deterministic given the model's tool choice. Tool-choice success is MODEL behavior and varies per run."
+  },
+  "cases": [
+    {
+      "case": "1_calculator_grounding",
+      "rep": 1,
+      "tool_choice_ok": true,
+      "final_value_ok": true,
+      "guarded": false,
+      "answer": "The result of 7284 * 931 is 6781404."
+    },
+    {
+      "case": "1b_calculator_cached_turn2",
+      "rep": 1,
+      "cache_served": true,
+      "final_value_ok": true,
+      "answer": "The result of 7284 multiplied by 931 is 6,781,404."
+    },
+    {
+      "case": "2_vulnerable_layout_guarded",
+      "rep": 1,
+      "tool_choice_ok": true,
+      "final_value_ok": true,
+      "guarded": false,
+      "answer": "The result of 7284 * 931 is 6,781,404."
+    },
+    {
+      "case": "3_multistep_datetime_plus_calc",
+      "rep": 1,
+      "tool_choice_ok": true,
+      "final_value_ok": true,
+      "answer": "The current date is September 30, 2026, and 8% of 12500 is 1000."
+    },
+    {
+      "case": "4_replan_then_grounded",
+      "rep": 1,
+      "final_value_ok": true,
+      "answer": "The product of 7284 and 931 is 6,781,404. Recent news about LangGraph includes an article titled \"LangGraph adoption grows for agent orchestration\" on example.com, discussing its graph-based orchestration with checkpoint"
+    },
+    {
+      "case": "6_refresh_bypasses_cache",
+      "rep": 1,
+      "turn1_dispatched": 1,
+      "turn2_redispatched": true,
+      "final_value_ok": true
+    },
+    {
+      "case": "7_conversational_no_interference",
+      "rep": 1,
+      "no_tools": true,
+      "fallback_leak": false,
+      "answer": "RAM is volatile memory that temporarily stores data the CPU can access quickly, while disk is non-volatile storage that permanently holds data but is slower to "
+    },
+    {
+      "case": "1_calculator_grounding",
+      "rep": 2,
+      "tool_choice_ok": true,
+      "final_value_ok": true,
+      "guarded": false,
+      "answer": "The result of 7284 * 931 is 6781404."
+    },
+    {
+      "case": "1b_calculator_cached_turn2",
+      "rep": 2,
+      "cache_served": true,
+      "final_value_ok": true,
+      "answer": "The result of 7284 * 931 is 6,781,404."
+    },
+    {
+      "case": "2_vulnerable_layout_guarded",
+      "rep": 2,
+      "tool_choice_ok": true,
+      "final_value_ok": true,
+      "guarded": false,
+      "answer": "The result of 7284 * 931 is 6,781,404."
+    },
+    {
+      "case": "3_multistep_datetime_plus_calc",
+      "rep": 2,
+      "tool_choice_ok": true,
+      "final_value_ok": true,
+      "answer": "The current date is Wednesday, September 30, 2026. 8% of 12500 is 1000."
+    },
+    {
+      "case": "4_replan_then_grounded",
+      "rep": 2,
+      "final_value_ok": true,
+      "answer": "The product of 7284 and 931 is 6,781,404. A recent article mentions LangGraph's adoption for agent orchestration, noting that it provides graph-based orchestration with checkpointing."
+    },
+    {
+      "case": "6_refresh_bypasses_cache",
+      "rep": 2,
+      "turn1_dispatched": 1,
+      "turn2_redispatched": true,
+      "final_value_ok": true
+    },
+    {
+      "case": "7_conversational_no_interference",
+      "rep": 2,
+      "no_tools": true,
+      "fallback_leak": false,
+      "answer": "RAM is volatile memory for quick CPU access, while disk is non-volatile storage with larger capacity but slower access speeds."
+    }
+  ]
+}

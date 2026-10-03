@@ -33,6 +33,10 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
+        # v0.28: args-dependent effective risk of the MOST RECENT dispatch
+        # (see dispatch_async). Read by the orchestrator right after the
+        # risk check to decide confirmation parking.
+        self.last_effective_risk: str | None = None
 
     # ── Registration ───────────────────────────────────────────────────────────
 
@@ -86,6 +90,47 @@ class ToolRegistry:
         if tool is None:
             return "UNKNOWN"
         return str(tool.risk_level)
+
+    def effective_risk_level(self, tool_name: str, tool_args_json: str) -> str:
+        """
+        v0.28: the risk level for THIS call — args-dependent when the tool
+        declares ``risk_for_args`` (browser actions worded submit/delete →
+        SYSTEM tier), else the static level. Runs the tool's own Pydantic
+        validation WITHOUT dispatching, so an unparseable-args call keeps
+        the STATIC (ceiling) level and the validation error surfaces later
+        at dispatch exactly as before. Any classifier error degrades to the
+        static level — dynamic risk can never WIDEN permissions, only
+        narrow them (fail closed toward more caution).
+        """
+        tool = self._tools.get(tool_name)
+        static_level = self.get_tool_risk_level(tool_name)
+        if tool is None:
+            return static_level
+        if not hasattr(type(tool), "risk_for_args"):
+            return static_level
+        try:
+            raw_args: dict[str, Any] = (
+                json.loads(tool_args_json) if tool_args_json else {}
+            )
+        except json.JSONDecodeError:
+            return static_level
+        try:
+            validated = tool._args_model.model_validate(raw_args)
+            args = validated.model_dump(exclude_unset=True)
+            dynamic = tool.risk_for_args(args)
+            if not dynamic:
+                return static_level
+        except Exception as e:  # noqa: BLE001 - degrade to static, never widen
+            log.warning("effective_risk_degraded", tool=tool_name, error=str(e))
+            return static_level
+        # Escalation is the only direction dynamic risk may move relative to
+        # the static ceiling when the static level is auto-allowed; a tool
+        # that declares a stricter static level keeps it.
+        _tier_rank = {"SAFE": 0, "NETWORK": 1, "FILE_READ": 1, "FILE_WRITE": 2,
+                      "SYSTEM": 3, "DESTRUCTIVE": 4}
+        if _tier_rank.get(str(dynamic), 99) > _tier_rank.get(static_level, 99):
+            return str(dynamic)
+        return static_level
 
     # ── Dispatch ───────────────────────────────────────────────────────────────
 
@@ -217,11 +262,24 @@ class ToolRegistry:
         
         timeout = float(tool.timeout_seconds)
 
+        # v0.28: args-dependent risk (browser actions) — computed from the
+        # VALIDATED arguments BEFORE dispatch. The tool class owns the
+        # classification; the orchestrator's PermissionGuard then treats
+        # the result exactly like a static risk level (same tiers, same
+        # confirmation flow — no second permission system).
+        effective_risk_level = str(tool.risk_level)
+        try:
+            dynamic = tool.risk_for_args(args)
+            if dynamic:
+                effective_risk_level = str(dynamic)
+        except Exception as e:  # noqa: BLE001 - degrade to static, never widen
+            log.warning("dynamic_risk_degraded", tool=tool_name, error=str(e))
+
         log.info(
             "tool_dispatching_async",
             tool=tool_name,
             args=args,
-            risk_level=tool.risk_level,
+            risk_level=effective_risk_level,
             timeout_seconds=timeout,
         )
 
@@ -230,6 +288,10 @@ class ToolRegistry:
             result = await asyncio.wait_for(tool.run_async(**args), timeout=timeout)
             elapsed = time.monotonic() - started
             log.info("tool_success_async", tool=tool_name, elapsed_seconds=round(elapsed, 3))
+            # v0.28: the EFFECTIVE risk level is exposed to the caller via a
+            # side-channel attribute (single-threaded dispatch per session;
+            # read immediately by the orchestrator for gating decisions).
+            self.last_effective_risk = effective_risk_level
             return result
 
         except asyncio.TimeoutError:

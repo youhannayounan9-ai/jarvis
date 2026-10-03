@@ -12,6 +12,43 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class BrowserStatus(BaseModel):
+    """
+    v0.28 safe browser status (read-only; safe metadata only — never page
+    content, URLs visited, or download payloads).
+    """
+
+    enabled: bool = Field(..., description="Whether the browser tool surface is registered.")
+    driver: str = Field(..., description="Configured driver: simulated | playwright.")
+    emergency_stop_active: bool
+    emergency_stop_reason: str = ""
+    emergency_stop_token: int = 0
+    open_sessions: int = Field(0, description="Currently open browser controllers.")
+    max_sessions: int
+    downloads_captured: int = Field(0, description="Bounded download metadata count for open sessions.")
+
+
+class BrowserStopRequest(BaseModel):
+    """Body for POST /browser/emergency-stop (optional reason)."""
+
+    reason: str = Field(
+        default="user requested emergency stop",
+        max_length=200,
+        description="Short human reason recorded with the stop token.",
+    )
+
+
+class BrowserStopResponse(BaseModel):
+    triggered: bool
+    token: int
+    reason: str
+
+
+class BrowserResetResponse(BaseModel):
+    was_active: bool
+    message: str = ""
+
+
 class ChatRequest(BaseModel):
     """One user turn for an agent session."""
 
@@ -33,6 +70,16 @@ class ChatRequest(BaseModel):
             "work independently."
         ),
     )
+
+
+class MultimodalResponse(BaseModel):
+    """Reply for a multimodal turn (v0.27): text plus light metadata."""
+
+    session_id: str
+    response: str
+    modality: str
+    pending_confirmation: PendingAction | None = None
+    request_id: str | None = None
 
 
 class ConfirmationRequest(BaseModel):
@@ -76,6 +123,106 @@ class HealthResponse(BaseModel):
     # v0.10: auth + code-execution posture surfaced for operators.
     auth_enabled: bool = False
     code_execution: str = "disabled"  # disabled | docker_isolated
+
+
+# ── v0.29: integration management (metadata only — never credentials) ────────
+
+
+class IntegrationAccountInfo(BaseModel):
+    """One connected account's PUBLIC metadata (credential-free by type)."""
+
+    account_id: str
+    provider: str
+    display_label: str
+    scopes: list[str]
+    authenticated: bool
+    auth_state: str
+    granted_at: str
+    last_verified_at: str | None = None
+    provider_account_ref: str = ""
+    # v0.30 (safe metadata only): normalized OAuth lifecycle + timestamps.
+    # Token material is structurally absent — these are strings/None. The
+    # authorization_* names keep the v0.29 "no token-ish public key" guard.
+    authorization_status: str | None = None
+    authorization_expires_at: str | None = None
+    authorization_updated_at: str | None = None
+
+
+class IntegrationConnectRequest(BaseModel):
+    """Body for POST /integrations/{provider}/connect (user-controlled)."""
+
+    display_label: str = Field(..., min_length=1, max_length=64)
+    scopes: list[str] = Field(
+        ..., min_length=1, max_length=8,
+        description="EXACT scopes to grant (validated against the provider menu).",
+    )
+    credential: str | None = Field(
+        default=None, max_length=512,
+        description=(
+            "Optional credential for development providers. Never sent by "
+            "the chat model; omitted = generated local-dev token. Never "
+            "returned by any endpoint after this request."
+        ),
+    )
+    provider_account_ref: str = Field(default="", max_length=120)
+
+
+class IntegrationAuthorizeRequest(BaseModel):
+    """Body for POST /integrations/{provider}/authorize (OPERATOR-controlled)."""
+
+    session_id: str = Field(
+        ..., min_length=1, max_length=64,
+        description="Local session the authorization is bound to (state binding).",
+    )
+    display_label: str = Field(..., min_length=1, max_length=64)
+    scopes: list[str] = Field(..., min_length=1, max_length=8)
+
+
+class IntegrationAuthorizationStart(BaseModel):
+    """
+    A started OAuth flow. The OPERATOR opens ``authorization_url`` in a
+    browser; the provider redirects back to ``redirect_uri`` (our fixed
+    callback + our own session parameter). The raw state lives ONLY inside
+    the URL — it is never returned separately, logged, or shown to the model.
+    """
+
+    provider: str
+    display_label: str
+    scopes: list[str]
+    authorization_url: str
+    redirect_uri: str
+    expires_in: int
+
+
+class IntegrationStatusResponse(BaseModel):
+    """Bounded authorization-flow polling view (no state values, ever)."""
+
+    status: str
+    provider: str
+    display_label: str | None = None
+
+
+class IntegrationDisconnectResponse(BaseModel):
+    disconnected: bool
+    account_id: str
+    message: str
+
+
+class IntegrationAuditEntry(BaseModel):
+    """One EXTERNAL side-effect audit row (bounded, sanitized summary)."""
+
+    ts: str
+    provider: str
+    account_id: str
+    operation: str
+    resource_kind: str
+    resource_id: str | None = None
+    risk_category: str
+    request_id: str
+    idempotency_key: str | None = None
+    state: str
+    verification: str = "NOT_APPLICABLE"
+    result_summary: str | None = None
 
 
 # ── v0.18: operator introspection + explicit UNKNOWN recovery ─────────────────

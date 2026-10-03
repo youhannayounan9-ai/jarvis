@@ -107,6 +107,10 @@ _TTL_OVERRIDE = {
     "web_scrape": lambda: settings.RESULT_CACHE_WEB_TTL_SECONDS,
     "wikipedia_summary": lambda: settings.RESULT_CACHE_WIKI_TTL_SECONDS,
     "calculator": lambda: settings.RESULT_CACHE_CALC_TTL_SECONDS,
+    # v0.29: integration reads (calendar/task) — deliberately SHORT.
+    "calendar_list_events": lambda: settings.RESULT_CACHE_INTEGRATION_TTL_SECONDS,
+    "calendar_get_event": lambda: settings.RESULT_CACHE_INTEGRATION_TTL_SECONDS,
+    "task_list": lambda: settings.RESULT_CACHE_INTEGRATION_TTL_SECONDS,
 }
 
 
